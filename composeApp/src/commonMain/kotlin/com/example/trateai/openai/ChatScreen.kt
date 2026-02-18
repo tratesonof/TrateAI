@@ -16,7 +16,7 @@ fun ChatScreen() {
 
     val client = remember {
         OpenAiClient(
-            apiKeyProvider = { API_KEY },
+            apiKeyProvider = { openAiApiKey() },
             httpClient = platformHttpClient()
         )
     }
@@ -79,5 +79,3 @@ fun ChatScreen() {
         }
     }
 }
-
-private const val API_KEY = "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"

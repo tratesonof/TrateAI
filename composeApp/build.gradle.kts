@@ -1,5 +1,6 @@
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
@@ -55,6 +56,13 @@ kotlin {
     }
 }
 
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
+val openAiKey = (localProps.getProperty("OPENAI_API_KEY") ?: "").trim()
+
 android {
     namespace = "com.example.trateai"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
@@ -65,6 +73,8 @@ android {
         targetSdk = libs.versions.android.targetSdk.get().toInt()
         versionCode = 1
         versionName = "1.0"
+
+        buildConfigField("String", "OPENAI_API_KEY", "\"$openAiKey\"")
     }
     packaging {
         resources {
@@ -80,9 +90,18 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+
+    buildFeatures {
+        buildConfig = true
+    }
 }
 
 dependencies {
     debugImplementation(libs.compose.uiTooling)
 }
 
+
+//Tell me about IT
+//Tell me about IT in bullet points
+//Tell me about IT in 10 bullet points
+//Tell me about IT in 10 bullet points, stop after 5th point
