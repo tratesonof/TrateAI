@@ -99,9 +99,3 @@ android {
 dependencies {
     debugImplementation(libs.compose.uiTooling)
 }
-
-
-//Tell me about IT
-//Tell me about IT in bullet points
-//Tell me about IT in 10 bullet points
-//Tell me about IT in 10 bullet points, stop after 5th point
