@@ -14,6 +14,8 @@ import kotlinx.coroutines.launch
 fun ChatScreen() {
     val scope = rememberCoroutineScope()
 
+    var temperature by remember { mutableStateOf(0.7f) }
+
     val client = remember {
         OpenAiClient(
             apiKeyProvider = { openAiApiKey() },
@@ -30,13 +32,19 @@ fun ChatScreen() {
         TopAppBar(title = { Text("TrateAI Chat") })
 
         LazyColumn(
-            modifier = Modifier.weight(1f).fillMaxWidth().padding(12.dp),
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             items(messages) { (role, text) ->
                 ElevatedCard(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp)) {
-                        Text(if (role == "user") "You" else "GPT", style = MaterialTheme.typography.labelMedium)
+                        Text(
+                            text = if (role == "user") "You" else "GPT",
+                            style = MaterialTheme.typography.labelMedium
+                        )
                         Spacer(Modifier.height(6.dp))
                         Text(text)
                     }
@@ -44,10 +52,34 @@ fun ChatScreen() {
             }
 
             if (isLoading) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-            error?.let { e -> item { Text("Error: $e", color = MaterialTheme.colorScheme.error) } }
+            error?.let { e ->
+                item { Text("Error: $e", color = MaterialTheme.colorScheme.error) }
+            }
         }
 
-        Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp)
+        ) {
+            Text(
+                text = "Temperature: ${(temperature * 100).toInt() / 100f}",
+                style = MaterialTheme.typography.labelMedium
+            )
+            Slider(
+                value = temperature,
+                onValueChange = { temperature = it },
+                valueRange = 0f..2f,
+                steps = 20
+            )
+        }
+
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             OutlinedTextField(
                 modifier = Modifier.weight(1f),
                 value = input,
@@ -66,7 +98,10 @@ fun ChatScreen() {
 
                     scope.launch {
                         try {
-                            val reply = client.chat(userText = text)
+                            val reply = client.chat(
+                                userText = text,
+                                temperature = temperature.toDouble()
+                            )
                             messages += "assistant" to reply
                         } catch (t: Throwable) {
                             error = t.message ?: t.toString()

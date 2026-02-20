@@ -16,6 +16,7 @@ class OpenAiClient(
 ) {
     suspend fun chat(
         userText: String,
+        temperature: Double,
         systemText: String? = null,
         model: String = "gpt-5.2"
     ): String {
@@ -27,7 +28,7 @@ class OpenAiClient(
         val resp: ResponsesResponse = httpClient.post("https://api.openai.com/v1/responses") {
             header(HttpHeaders.Authorization, "Bearer ${apiKeyProvider()}")
             contentType(ContentType.Application.Json)
-            setBody(ResponsesRequest(model = model, input = input))
+            setBody(ResponsesRequest(model = model, input = input, temperature = temperature))
         }.body()
 
         return resp.extractText()
@@ -37,7 +38,8 @@ class OpenAiClient(
 @Serializable
 private data class ResponsesRequest(
     val model: String,
-    val input: List<InputMessage>
+    val input: List<InputMessage>,
+    val temperature: Double? = null,
 )
 
 @Serializable
