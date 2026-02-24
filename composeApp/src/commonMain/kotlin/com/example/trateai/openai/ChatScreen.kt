@@ -35,6 +35,8 @@ import kotlinx.coroutines.launch
 import kotlin.math.round
 import kotlin.time.TimeSource
 
+private const val LAST_TURNS = 6
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen() {
@@ -55,7 +57,12 @@ fun ChatScreen() {
     var input by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    val messages = remember { mutableStateListOf<Pair<String, String>>() }
+
+    val messagesUi = remember { mutableStateListOf<Pair<String, String>>() } // role -> text
+
+    var summary by remember { mutableStateOf("") }
+
+    val lastMessages = remember { mutableStateListOf<ChatMessage>() }
 
     Column(Modifier.fillMaxSize()) {
         TopAppBar(title = { Text("TrateAI Chat") })
@@ -67,7 +74,7 @@ fun ChatScreen() {
                 .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            items(messages) { (role, text) ->
+            items(messagesUi) { (role, text) ->
                 ElevatedCard(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp)) {
                         Text(
@@ -81,9 +88,7 @@ fun ChatScreen() {
             }
 
             if (isLoading) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-            error?.let { e ->
-                item { Text("Error: $e", color = MaterialTheme.colorScheme.error) }
-            }
+            error?.let { e -> item { Text("Error: $e", color = MaterialTheme.colorScheme.error) } }
         }
 
         Column(
@@ -98,9 +103,7 @@ fun ChatScreen() {
                 onExpandedChange = { modelMenuExpanded = !modelMenuExpanded }
             ) {
                 OutlinedTextField(
-                    modifier = Modifier
-                        .menuAnchor()
-                        .fillMaxWidth(),
+                    modifier = Modifier.menuAnchor().fillMaxWidth(),
                     value = selectedModel.title,
                     onValueChange = {},
                     readOnly = true,
@@ -163,17 +166,25 @@ fun ChatScreen() {
             Button(
                 enabled = input.isNotBlank() && !isLoading,
                 onClick = {
-                    val text = input.trim()
+                    val userText = input.trim()
                     input = ""
-                    messages += "user" to text
+
+                    // UI
+                    messagesUi += "user" to userText
+
+                    lastMessages += ChatMessage(role = "user", content = userText)
+                    trimLastMessagesInPlace(lastMessages)
+
                     isLoading = true
                     error = null
 
                     scope.launch {
                         val started = TimeSource.Monotonic.markNow()
                         try {
+                            val requestMessages = buildRequestMessages(summary, lastMessages)
+
                             val result = client.chat(
-                                userText = text,
+                                messages = requestMessages,
                                 temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
                                 model = selectedModel.id
                             )
@@ -189,10 +200,30 @@ fun ChatScreen() {
                                         "inputTokens=${usage?.inputTokens} " +
                                         "outputTokens=${usage?.outputTokens} " +
                                         "totalTokens=${usage?.totalTokens} " +
-                                        "costUsd=$costUsd"
+                                        "costUsd=$costUsd " +
+                                        "summaryLen=${summary.length} " +
+                                        "lastMsgs=${lastMessages.size}"
                             )
 
-                            messages += "assistant" to result.text
+                            messagesUi += "assistant" to result.text
+
+                            lastMessages += ChatMessage(role = "assistant", content = result.text)
+                            trimLastMessagesInPlace(lastMessages)
+
+                            if (shouldSummarize(summary, lastMessages)) {
+                                val sumStarted = TimeSource.Monotonic.markNow()
+
+                                val newSummary = summarizeLocally(
+                                    client = client,
+                                    currentSummary = summary,
+                                    recentMessages = lastMessages.toList()
+                                )
+
+                                summary = newSummary
+
+                                val sumLatencyMs = sumStarted.elapsedNow().inWholeMilliseconds
+                                println("OPENAI summarize latencyMs=$sumLatencyMs summaryLen=${summary.length}")
+                            }
                         } catch (t: Throwable) {
                             error = t.message ?: t.toString()
                         } finally {
@@ -203,6 +234,74 @@ fun ChatScreen() {
             ) { Text("Send") }
         }
     }
+}
+
+private fun buildRequestMessages(
+    summary: String,
+    lastMessages: List<ChatMessage>
+): List<ChatMessage> {
+    val system = buildString {
+        append("Ты полезный ассистент. Отвечай кратко и по делу.\n")
+        append("Если в диалоге уже есть договорённости/факты — соблюдай их.\n")
+        if (summary.isNotBlank()) {
+            append("\nКонтекст (summary):\n")
+            append(summary)
+        }
+    }
+
+    return buildList {
+        add(ChatMessage(role = "system", content = system))
+        addAll(lastMessages)
+    }
+}
+
+private fun trimLastMessagesInPlace(list: MutableList<ChatMessage>) {
+    val maxMessages = LAST_TURNS * 2 // 6 ходов => до 12 сообщений
+    if (list.size <= maxMessages) return
+    val toRemove = list.size - maxMessages
+    repeat(toRemove) { list.removeAt(0) }
+}
+
+private fun shouldSummarize(summary: String, lastMessages: List<ChatMessage>): Boolean {
+    if (lastMessages.size < LAST_TURNS * 2) return false
+    return summary.length < 120 || (summary.length < 2000 && lastMessages.size == LAST_TURNS * 2)
+}
+
+private suspend fun summarizeLocally(
+    client: OpenAiClient,
+    currentSummary: String,
+    recentMessages: List<ChatMessage>
+): String {
+    val summarizerModel = "gpt-5-mini" // можно заменить на "gpt-5-nano" если хотите дешевле
+
+    val summaryPrompt = buildString {
+        append("Сжми контекст диалога.\n")
+        append("Верни краткое summary на русском в виде буллетов.\n")
+        append("Сохраняй: факты, предпочтения пользователя, задачи, принятые решения, ограничения.\n")
+        append("Не добавляй выдумок.\n")
+        append("Длина: до 1200 символов.\n")
+        if (currentSummary.isNotBlank()) {
+            append("\nТекущее summary:\n")
+            append(currentSummary)
+        }
+        append("\n\nПоследние сообщения:\n")
+        recentMessages.forEach { m ->
+            append("- ${m.role}: ${m.content}\n")
+        }
+    }
+
+    val request = listOf(
+        ChatMessage(role = "system", content = "Ты сжимаешь историю переписки в компактный контекст."),
+        ChatMessage(role = "user", content = summaryPrompt)
+    )
+
+    val res = client.chat(
+        messages = request,
+        temperature = null,
+        model = summarizerModel
+    )
+
+    return res.text.trim()
 }
 
 private data class ModelSpec(

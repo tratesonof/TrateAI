@@ -1,7 +1,10 @@
 package com.example.trateai.openai
 
-import io.ktor.client.*
-import io.ktor.client.request.*
+import io.ktor.client.HttpClient
+import io.ktor.client.request.accept
+import io.ktor.client.request.header
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
@@ -22,19 +25,13 @@ class OpenAiClient(
     }
 
     suspend fun chat(
-        userText: String,
+        messages: List<ChatMessage>,
         temperature: Double?,
         model: String,
-        systemText: String? = null,
     ): ChatResult {
-        val input = buildList {
-            if (!systemText.isNullOrBlank()) add(InputMessage("system", systemText))
-            add(InputMessage("user", userText))
-        }
-
         val req = ResponsesRequest(
             model = model,
-            input = input,
+            input = messages,
             temperature = temperature
         )
 
@@ -61,16 +58,16 @@ class OpenAiClient(
 }
 
 @Serializable
-private data class ResponsesRequest(
-    val model: String,
-    val input: List<InputMessage>,
-    val temperature: Double? = null,
+data class ChatMessage(
+    val role: String,
+    val content: String
 )
 
 @Serializable
-private data class InputMessage(
-    val role: String,
-    val content: String
+private data class ResponsesRequest(
+    val model: String,
+    val input: List<ChatMessage>,
+    val temperature: Double? = null,
 )
 
 @Serializable
