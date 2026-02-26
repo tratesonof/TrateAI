@@ -54,15 +54,25 @@ fun ChatScreen() {
         )
     }
 
+    val store = remember { ChatStateStore() }
+    val loaded = remember { store.load() }
+
     var input by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    val messagesUi = remember { mutableStateListOf<Pair<String, String>>() } // role -> text
+    val messagesUi = remember { mutableStateListOf<Pair<String, String>>() }
 
-    var summary by remember { mutableStateOf("") }
+    var summary by remember { mutableStateOf(loaded.summary) }
+    val lastMessages = remember { mutableStateListOf<ChatMessage>().apply { addAll(loaded.lastMessages) } }
 
-    val lastMessages = remember { mutableStateListOf<ChatMessage>() }
+    // ===== Token counters (session-only) =====
+    // Last request only:
+    var lastRequestInputTokens by remember { mutableStateOf(0L) }   // input ONLY for the last request
+    var lastResponseOutputTokens by remember { mutableStateOf(0L) } // output ONLY for the last response
+
+    // Whole dialogue within app session:
+    var sessionDialogueTokensTotal by remember { mutableStateOf(0L) } // sum(total_tokens) per chat call (incl. summarization)
 
     Column(Modifier.fillMaxSize()) {
         TopAppBar(title = { Text("TrateAI Chat") })
@@ -91,6 +101,7 @@ fun ChatScreen() {
             error?.let { e -> item { Text("Error: $e", color = MaterialTheme.colorScheme.error) } }
         }
 
+        // Model selector
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -128,6 +139,7 @@ fun ChatScreen() {
             }
         }
 
+        // Temperature slider
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -150,6 +162,25 @@ fun ChatScreen() {
             )
         }
 
+        // Footer stats
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 6.dp)
+        ) {
+            Text(
+                "Last request • in: $lastRequestInputTokens  out: $lastResponseOutputTokens",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                "Session dialogue tokens total: $sessionDialogueTokensTotal",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        // Input row
         Row(
             Modifier
                 .fillMaxWidth()
@@ -169,11 +200,11 @@ fun ChatScreen() {
                     val userText = input.trim()
                     input = ""
 
-                    // UI
                     messagesUi += "user" to userText
 
                     lastMessages += ChatMessage(role = "user", content = userText)
                     trimLastMessagesInPlace(lastMessages)
+                    store.save(ChatState(summary = summary, lastMessages = lastMessages.toList()))
 
                     isLoading = true
                     error = null
@@ -189,41 +220,35 @@ fun ChatScreen() {
                                 model = selectedModel.id
                             )
 
+                            // ===== last request only =====
+                            lastRequestInputTokens = (result.usage?.inputTokens ?: 0).toLong()
+                            lastResponseOutputTokens = (result.usage?.outputTokens ?: 0).toLong()
+
+                            // ===== whole dialogue within session =====
+                            val reqTotal = (result.usage?.totalTokens
+                                ?: (lastRequestInputTokens + lastResponseOutputTokens).toInt()
+                                    ).toLong()
+                            sessionDialogueTokensTotal += reqTotal
+
                             val latencyMs = started.elapsedNow().inWholeMilliseconds
-                            val usage = result.usage
-                            val costUsd = estimateCostUsd(usage, selectedModel)
+                            val costUsd = estimateCostUsd(result.usage, selectedModel)
 
                             println(
                                 "OPENAI " +
                                         "model=${selectedModel.id} " +
                                         "latencyMs=$latencyMs " +
-                                        "inputTokens=${usage?.inputTokens} " +
-                                        "outputTokens=${usage?.outputTokens} " +
-                                        "totalTokens=${usage?.totalTokens} " +
-                                        "costUsd=$costUsd " +
-                                        "summaryLen=${summary.length} " +
-                                        "lastMsgs=${lastMessages.size}"
+                                        "lastReqInputTokens=$lastRequestInputTokens " +
+                                        "lastRespOutputTokens=$lastResponseOutputTokens " +
+                                        "sessionDialogueTokensTotal=$sessionDialogueTokensTotal " +
+                                        "costUsd=$costUsd"
                             )
 
                             messagesUi += "assistant" to result.text
 
                             lastMessages += ChatMessage(role = "assistant", content = result.text)
                             trimLastMessagesInPlace(lastMessages)
+                            store.save(ChatState(summary = summary, lastMessages = lastMessages.toList()))
 
-                            if (shouldSummarize(summary, lastMessages)) {
-                                val sumStarted = TimeSource.Monotonic.markNow()
-
-                                val newSummary = summarizeLocally(
-                                    client = client,
-                                    currentSummary = summary,
-                                    recentMessages = lastMessages.toList()
-                                )
-
-                                summary = newSummary
-
-                                val sumLatencyMs = sumStarted.elapsedNow().inWholeMilliseconds
-                                println("OPENAI summarize latencyMs=$sumLatencyMs summaryLen=${summary.length}")
-                            }
                         } catch (t: Throwable) {
                             error = t.message ?: t.toString()
                         } finally {
@@ -256,7 +281,7 @@ private fun buildRequestMessages(
 }
 
 private fun trimLastMessagesInPlace(list: MutableList<ChatMessage>) {
-    val maxMessages = LAST_TURNS * 2 // 6 ходов => до 12 сообщений
+    val maxMessages = LAST_TURNS * 2
     if (list.size <= maxMessages) return
     val toRemove = list.size - maxMessages
     repeat(toRemove) { list.removeAt(0) }
@@ -267,12 +292,17 @@ private fun shouldSummarize(summary: String, lastMessages: List<ChatMessage>): B
     return summary.length < 120 || (summary.length < 2000 && lastMessages.size == LAST_TURNS * 2)
 }
 
-private suspend fun summarizeLocally(
+private data class SummaryResult(
+    val text: String,
+    val usage: ResponseUsage?
+)
+
+private suspend fun summarizeLocallyWithUsage(
     client: OpenAiClient,
     currentSummary: String,
     recentMessages: List<ChatMessage>
-): String {
-    val summarizerModel = "gpt-5-mini" // можно заменить на "gpt-5-nano" если хотите дешевле
+): SummaryResult {
+    val summarizerModel = "gpt-5-mini"
 
     val summaryPrompt = buildString {
         append("Сжми контекст диалога.\n")
@@ -301,7 +331,7 @@ private suspend fun summarizeLocally(
         model = summarizerModel
     )
 
-    return res.text.trim()
+    return SummaryResult(text = res.text.trim(), usage = res.usage)
 }
 
 private data class ModelSpec(
