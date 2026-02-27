@@ -22,20 +22,15 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.round
 import kotlin.time.TimeSource
 
-private const val LAST_TURNS = 6
+private const val HISTORY_WINDOW_MESSAGES = 6
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -58,21 +53,22 @@ fun ChatScreen() {
     val loaded = remember { store.load() }
 
     var input by remember { mutableStateOf("") }
-    var isLoading by remember { mutableStateOf(false) }
+    var isWaitingResponse by remember { mutableStateOf(false) }
+    var isSummarizing by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
     val messagesUi = remember { mutableStateListOf<Pair<String, String>>() }
 
     var summary by remember { mutableStateOf(loaded.summary) }
-    val lastMessages = remember { mutableStateListOf<ChatMessage>().apply { addAll(loaded.lastMessages) } }
+    val history = remember { mutableStateListOf<ChatMessage>().apply { addAll(loaded.lastMessages) } } // <= 6 сообщений
 
-    // ===== Token counters (session-only) =====
-    // Last request only:
-    var lastRequestInputTokens by remember { mutableStateOf(0L) }   // input ONLY for the last request
-    var lastResponseOutputTokens by remember { mutableStateOf(0L) } // output ONLY for the last response
+    // tokens
+    var lastRequestInputTokens by remember { mutableStateOf(0L) }   // только для последнего запроса
+    var lastResponseOutputTokens by remember { mutableStateOf(0L) } // только для последнего ответа
+    var sessionDialogueTokensTotal by remember { mutableStateOf(0L) } // накопительно за сессию (включая суммаризацию)
 
-    // Whole dialogue within app session:
-    var sessionDialogueTokensTotal by remember { mutableStateOf(0L) } // sum(total_tokens) per chat call (incl. summarization)
+    // чтобы не запускать несколько суммаризаций одновременно
+    var summarizeJob by remember { mutableStateOf<Job?>(null) }
 
     Column(Modifier.fillMaxSize()) {
         TopAppBar(title = { Text("TrateAI Chat") })
@@ -97,7 +93,24 @@ fun ChatScreen() {
                 }
             }
 
-            if (isLoading) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+            if (isWaitingResponse) {
+                item {
+                    Column {
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                        Text("Waiting for model response…", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+
+            if (isSummarizing) {
+                item {
+                    Column {
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                        Text("Summarizing history…", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+
             error?.let { e -> item { Text("Error: $e", color = MaterialTheme.colorScheme.error) } }
         }
 
@@ -139,7 +152,7 @@ fun ChatScreen() {
             }
         }
 
-        // Temperature slider
+        // Temperature
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -166,7 +179,7 @@ fun ChatScreen() {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 6.dp)
+                .padding(12.dp)
         ) {
             Text(
                 "Last request • in: $lastRequestInputTokens  out: $lastResponseOutputTokens",
@@ -174,13 +187,18 @@ fun ChatScreen() {
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
-                "Session dialogue tokens total: $sessionDialogueTokensTotal",
+                "Session tokens total: $sessionDialogueTokensTotal",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                "History window: ${history.size}/$HISTORY_WINDOW_MESSAGES",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
 
-        // Input row
+        // Input
         Row(
             Modifier
                 .fillMaxWidth()
@@ -192,67 +210,106 @@ fun ChatScreen() {
                 value = input,
                 onValueChange = { input = it },
                 singleLine = true,
-                placeholder = { Text("Сообщение…") }
+                placeholder = { Text("Message…") }
             )
             Button(
-                enabled = input.isNotBlank() && !isLoading,
+                enabled = input.isNotBlank() && !isWaitingResponse,
                 onClick = {
                     val userText = input.trim()
                     input = ""
+                    error = null
 
                     messagesUi += "user" to userText
 
-                    lastMessages += ChatMessage(role = "user", content = userText)
-                    trimLastMessagesInPlace(lastMessages)
-                    store.save(ChatState(summary = summary, lastMessages = lastMessages.toList()))
-
-                    isLoading = true
-                    error = null
-
                     scope.launch {
-                        val started = TimeSource.Monotonic.markNow()
-                        try {
-                            val requestMessages = buildRequestMessages(summary, lastMessages)
+                        // 1) Если окно истории заполнено (6 сообщений) — запускаем суммаризацию ПАРАЛЛЕЛЬНО,
+                        //    а историю ресетим сразу, чтобы начать новый цикл.
+                        if (history.size >= HISTORY_WINDOW_MESSAGES && (summarizeJob?.isActive != true)) {
+                            val chunk = history.toList()
+                            val summaryAtStart = summary
 
+                            // reset history immediately (per requirement) and persist
+                            history.clear()
+                            store.save(ChatState(summary = summary, lastMessages = history.toList()))
+
+                            summarizeJob = launch {
+                                isSummarizing = true
+                                try {
+                                    val sumRes = summarizeChunkWithUsage(
+                                        client = client,
+                                        currentSummary = summaryAtStart,
+                                        chunk = chunk
+                                    )
+
+                                    // важно: summary мог измениться позже — мы не хотим "затереть" новое.
+                                    // поэтому делаем merge: обновляем summary на базе текущего на момент завершения.
+                                    // самый простой лаконичный способ: ещё раз прогнать суммаризацию на (currentSummaryNow + chunk)
+                                    // мы уже сделали, поэтому просто применим результат, но только если summary не изменялся.
+                                    // если изменялся — делаем вторую быструю суммаризацию (редко).
+                                    val currentNow = summary
+                                    summary = if (currentNow == summaryAtStart) {
+                                        sumRes.text
+                                    } else {
+                                        // summary уже обновлялся чем-то ещё — пересобираем итог
+                                        summarizeChunkWithUsage(
+                                            client = client,
+                                            currentSummary = currentNow,
+                                            chunk = chunk
+                                        ).text
+                                    }
+
+                                    store.save(ChatState(summary = summary, lastMessages = history.toList()))
+
+                                    // токены суммаризации учитываем в session total
+                                    val sumTotal = (sumRes.usage?.totalTokens ?: 0).toLong()
+                                    sessionDialogueTokensTotal += sumTotal
+
+                                    println("OPENAI summarize tokensTotal=$sumTotal sessionTokensTotal=$sessionDialogueTokensTotal")
+                                } catch (t: Throwable) {
+                                    println("OPENAI summarize error: ${t.message ?: t}")
+                                } finally {
+                                    isSummarizing = false
+                                }
+                            }
+                        }
+
+                        // 2) Добавляем текущее user-сообщение в НОВОЕ окно истории и сохраняем
+                        history += ChatMessage(role = "user", content = userText)
+                        trimHistoryToWindow(history)
+                        store.save(ChatState(summary = summary, lastMessages = history.toList()))
+
+                        // 3) Основной запрос (ждём ответ). Суммаризация при этом может идти параллельно.
+                        isWaitingResponse = true
+                        val started = TimeSource.Monotonic.markNow()
+
+                        try {
                             val result = client.chat(
-                                messages = requestMessages,
+                                messages = buildRequestMessages(summary, history),
                                 temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
                                 model = selectedModel.id
                             )
 
-                            // ===== last request only =====
                             lastRequestInputTokens = (result.usage?.inputTokens ?: 0).toLong()
                             lastResponseOutputTokens = (result.usage?.outputTokens ?: 0).toLong()
-
-                            // ===== whole dialogue within session =====
-                            val reqTotal = (result.usage?.totalTokens
-                                ?: (lastRequestInputTokens + lastResponseOutputTokens).toInt()
-                                    ).toLong()
-                            sessionDialogueTokensTotal += reqTotal
+                            sessionDialogueTokensTotal += (result.usage?.totalTokens ?: 0).toLong()
 
                             val latencyMs = started.elapsedNow().inWholeMilliseconds
-                            val costUsd = estimateCostUsd(result.usage, selectedModel)
-
                             println(
-                                "OPENAI " +
-                                        "model=${selectedModel.id} " +
-                                        "latencyMs=$latencyMs " +
-                                        "lastReqInputTokens=$lastRequestInputTokens " +
-                                        "lastRespOutputTokens=$lastResponseOutputTokens " +
-                                        "sessionDialogueTokensTotal=$sessionDialogueTokensTotal " +
-                                        "costUsd=$costUsd"
+                                "OPENAI model=${selectedModel.id} latencyMs=$latencyMs " +
+                                        "lastIn=$lastRequestInputTokens lastOut=$lastResponseOutputTokens " +
+                                        "sessionTokensTotal=$sessionDialogueTokensTotal"
                             )
 
                             messagesUi += "assistant" to result.text
 
-                            lastMessages += ChatMessage(role = "assistant", content = result.text)
-                            trimLastMessagesInPlace(lastMessages)
-                            store.save(ChatState(summary = summary, lastMessages = lastMessages.toList()))
-
+                            // 4) Добавляем ответ в окно истории и сохраняем
+                            history += ChatMessage(role = "assistant", content = result.text)
+                            trimHistoryToWindow(history)
+                            store.save(ChatState(summary = summary, lastMessages = history.toList()))
                         } catch (t: Throwable) {
                             error = t.message ?: t.toString()
                         } finally {
-                            isLoading = false
+                            isWaitingResponse = false
                         }
                     }
                 }
@@ -261,52 +318,44 @@ fun ChatScreen() {
     }
 }
 
-private fun buildRequestMessages(
-    summary: String,
-    lastMessages: List<ChatMessage>
-): List<ChatMessage> {
-    val system = buildString {
-        append("Ты полезный ассистент. Отвечай кратко и по делу.\n")
-        append("Если в диалоге уже есть договорённости/факты — соблюдай их.\n")
-        if (summary.isNotBlank()) {
-            append("\nКонтекст (summary):\n")
-            append(summary)
-        }
+private fun buildRequestMessages(summary: String, historyWindow: List<ChatMessage>): List<ChatMessage> =
+    buildList {
+        add(
+            ChatMessage(
+                role = "system",
+                content = buildString {
+                    append("Ты полезный ассистент. Отвечай кратко и по делу.\n")
+                    if (summary.isNotBlank()) {
+                        append("\nКонтекст (summary):\n")
+                        append(summary)
+                    }
+                }
+            )
+        )
+        addAll(historyWindow)
     }
 
-    return buildList {
-        add(ChatMessage(role = "system", content = system))
-        addAll(lastMessages)
-    }
+private fun trimHistoryToWindow(history: MutableList<ChatMessage>) {
+    if (history.size <= HISTORY_WINDOW_MESSAGES) return
+    repeat(history.size - HISTORY_WINDOW_MESSAGES) { history.removeAt(0) }
 }
 
-private fun trimLastMessagesInPlace(list: MutableList<ChatMessage>) {
-    val maxMessages = LAST_TURNS * 2
-    if (list.size <= maxMessages) return
-    val toRemove = list.size - maxMessages
-    repeat(toRemove) { list.removeAt(0) }
-}
+private data class SummaryResult(val text: String, val usage: ResponseUsage?)
 
-private fun shouldSummarize(summary: String, lastMessages: List<ChatMessage>): Boolean {
-    if (lastMessages.size < LAST_TURNS * 2) return false
-    return summary.length < 120 || (summary.length < 2000 && lastMessages.size == LAST_TURNS * 2)
-}
-
-private data class SummaryResult(
-    val text: String,
-    val usage: ResponseUsage?
-)
-
-private suspend fun summarizeLocallyWithUsage(
+/**
+ * Суммаризуем ровно "предыдущее окно" (6 сообщений) + текущий summary.
+ * По требованию: при 7-м сообщении мы запускаем это параллельно и ресетим историю.
+ */
+private suspend fun summarizeChunkWithUsage(
     client: OpenAiClient,
     currentSummary: String,
-    recentMessages: List<ChatMessage>
+    chunk: List<ChatMessage>
 ): SummaryResult {
     val summarizerModel = "gpt-5-mini"
 
-    val summaryPrompt = buildString {
-        append("Сжми контекст диалога.\n")
-        append("Верни краткое summary на русском в виде буллетов.\n")
+    val prompt = buildString {
+        append("Обнови краткий контекст диалога.\n")
+        append("Верни summary на русском в виде буллетов.\n")
         append("Сохраняй: факты, предпочтения пользователя, задачи, принятые решения, ограничения.\n")
         append("Не добавляй выдумок.\n")
         append("Длина: до 1200 символов.\n")
@@ -314,19 +363,15 @@ private suspend fun summarizeLocallyWithUsage(
             append("\nТекущее summary:\n")
             append(currentSummary)
         }
-        append("\n\nПоследние сообщения:\n")
-        recentMessages.forEach { m ->
-            append("- ${m.role}: ${m.content}\n")
-        }
+        append("\n\nНовый фрагмент диалога:\n")
+        chunk.forEach { m -> append("- ${m.role}: ${m.content}\n") }
     }
 
-    val request = listOf(
-        ChatMessage(role = "system", content = "Ты сжимаешь историю переписки в компактный контекст."),
-        ChatMessage(role = "user", content = summaryPrompt)
-    )
-
     val res = client.chat(
-        messages = request,
+        messages = listOf(
+            ChatMessage(role = "system", content = "Ты сжимаешь переписку в компактный контекст."),
+            ChatMessage(role = "user", content = prompt)
+        ),
         temperature = null,
         model = summarizerModel
     )
@@ -349,13 +394,3 @@ private val MODELS = listOf(
 )
 
 private fun roundTo2(v: Float): Float = round(v * 100f) / 100f
-
-private fun estimateCostUsd(
-    usage: ResponseUsage?,
-    model: ModelSpec
-): Double {
-    if (usage == null) return 0.0
-    val inCost = (usage.inputTokens / 1_000_000.0) * model.inputUsdPer1M
-    val outCost = (usage.outputTokens / 1_000_000.0) * model.outputUsdPer1M
-    return inCost + outCost
-}
