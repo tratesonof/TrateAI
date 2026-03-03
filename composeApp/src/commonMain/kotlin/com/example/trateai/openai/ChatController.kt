@@ -4,6 +4,7 @@ import androidx.compose.runtime.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
 import kotlin.time.TimeSource
 
 private const val HISTORY_WINDOW_MESSAGES = 6
@@ -43,16 +44,16 @@ class ChatController(
     // settings
     var temperature by mutableStateOf(0.7f)
     var selectedModel: ModelSpec by mutableStateOf(MODELS[1])
-
     var strategy by mutableStateOf(initial.strategy)
 
     // ===== Memory separation =====
     // short-term (strategy-specific)
-    var legacySummary by mutableStateOf(initial.summary) // legacy summary mode only
-    val legacyWindow = mutableStateListOf<ChatMessage>().apply { addAll(initial.lastMessages) } // legacy short-term window
+    var legacySummary by mutableStateOf(initial.summary)
+    val legacyWindow = mutableStateListOf<ChatMessage>().apply { addAll(initial.lastMessages) }
 
-    var slidingHistory by mutableStateOf(initial.slidingHistory) // sliding short-term
-    var factsHistory by mutableStateOf(initial.factsHistory)     // facts short-term
+    var slidingHistory by mutableStateOf(initial.slidingHistory)
+    var factsHistory by mutableStateOf(initial.factsHistory)
+
     var currentBranchId by mutableStateOf(initial.branching.currentBranchId)
     var branches by mutableStateOf(initial.branching.branches)
     var checkpoint by mutableStateOf<BranchCheckpoint?>(initial.branching.checkpoint)
@@ -68,7 +69,8 @@ class ChatController(
     // flags
     var isWaitingResponse by mutableStateOf(false)
     var isSummarizing by mutableStateOf(false)
-    var isUpdatingFacts by mutableStateOf(false) // используется UI; теперь это "memory routing"
+    // UI ранее называлось UpdatingFacts — теперь используем этот флаг как "Routing memory"
+    var isUpdatingFacts by mutableStateOf(false)
     var error by mutableStateOf<String?>(null)
 
     // tokens (persisted)
@@ -76,35 +78,39 @@ class ChatController(
     var lastResponseOutputTokens by mutableStateOf(initial.totalOutputTokens)
     var sessionDialogueTokensTotal by mutableStateOf(initial.totalTokens)
 
+    // ===== Debug/Audit: чтобы понимать, что попадает в каждый слой =====
+    var lastMemoryRouterRaw by mutableStateOf<String?>(null)
+    var lastMemoryRouterApplied by mutableStateOf<MemoryRouterResult?>(null)
+
     private var summarizeJob: Job? by mutableStateOf(null)
     private var memoryJob: Job? by mutableStateOf(null)
+
+    private val routerJson = Json {
+        ignoreUnknownKeys = true
+        explicitNulls = false
+        isLenient = true
+    }
 
     fun persistAll() {
         store.save(
             ChatState(
-                // legacy
                 summary = legacySummary,
                 lastMessages = legacyWindow.toList(),
 
-                // counters
                 totalInputTokens = lastRequestInputTokens,
                 totalOutputTokens = lastResponseOutputTokens,
                 totalTokens = sessionDialogueTokensTotal,
 
-                // settings/strategy
                 strategy = strategy,
 
-                // short-term per strategies
                 slidingHistory = slidingHistory,
                 factsHistory = factsHistory,
 
-                // working + long-term
                 workingFacts = workingFacts,
                 workingSummary = workingSummary,
                 longTermProfile = longTermProfile,
                 longTermNotes = longTermNotes,
 
-                // branching
                 branching = BranchingState(
                     currentBranchId = currentBranchId,
                     branches = branches,
@@ -117,6 +123,7 @@ class ChatController(
     fun updateStrategy(value: ContextStrategyType) {
         strategy = value
         persistAll()
+        println("MEMORY_UI strategy=${value.name}")
     }
 
     fun getCurrentBranch(): BranchState = branches[currentBranchId] ?: BranchState()
@@ -128,11 +135,13 @@ class ChatController(
     fun switchBranch(id: String) {
         currentBranchId = id
         persistAll()
+        println("MEMORY_UI switchBranch=$id")
     }
 
     fun createCheckpoint() {
         checkpoint = BranchCheckpoint(branchId = currentBranchId, state = getCurrentBranch().copy())
         persistAll()
+        println("MEMORY_UI checkpoint created for branch=$currentBranchId size=${getCurrentBranch().history.size}")
     }
 
     fun forkFromCheckpointTwoBranches() {
@@ -147,6 +156,7 @@ class ChatController(
             put(bId, base.copy())
         }
         persistAll()
+        println("MEMORY_UI fork from checkpoint -> created $aId and $bId (baseSize=${base.history.size})")
     }
 
     fun createNewBranch(): String {
@@ -154,6 +164,7 @@ class ChatController(
         branches = branches.toMutableMap().apply { put(newId, BranchState()) }
         currentBranchId = newId
         persistAll()
+        println("MEMORY_UI new branch created=$newId")
         return newId
     }
 
@@ -162,6 +173,7 @@ class ChatController(
         branches = mapOf("main" to BranchState())
         checkpoint = null
         persistAll()
+        println("MEMORY_UI branching reset -> main")
     }
 
     fun hasCheckpoint(): Boolean = checkpoint != null
@@ -172,7 +184,7 @@ class ChatController(
         error = null
         messagesUi += "user" to userText
 
-        // явное разнесение: роутим working/long-term отдельно от short-term
+        // Явное разнесение: роутим working/long-term отдельно от short-term
         routeMemoryAfterUser(userText)
 
         scope.launch {
@@ -189,27 +201,61 @@ class ChatController(
     private fun routeMemoryAfterUser(userText: String) {
         if (memoryJob?.isActive == true) return
 
+        val workingBefore = workingFacts
+        val longBefore = longTermProfile
+        val notesBefore = longTermNotes
+        val wsBefore = workingSummary
+
         memoryJob = scope.launch {
             isUpdatingFacts = true
             try {
-                val (r, usage) = MemoryRouter.route(
-                    client = client,
-                    userMessage = userText,
-                    assistantMessage = null,
-                    workingFacts = workingFacts,
-                    longTermProfile = longTermProfile,
-                    longTermNotes = longTermNotes
+                val (result, usage, raw) = routeMemoryInternal(
+                    userText = userText,
+                    workingFacts = workingBefore,
+                    longTermProfile = longBefore,
+                    longTermNotes = notesBefore
                 )
 
-                if (r != null) {
-                    workingFacts = applyDelta(workingFacts, r.workingFactsDelta)
-                    longTermProfile = applyDelta(longTermProfile, r.longTermDelta)
+                lastMemoryRouterRaw = raw
+                lastMemoryRouterApplied = result
 
-                    if (!r.workingSummaryDelta.isNullOrBlank()) {
-                        workingSummary = r.workingSummaryDelta.trim()
+                if (result != null) {
+                    // apply deltas explicitly
+                    val workingAfter = applyDelta(workingBefore, result.workingFactsDelta)
+                    val longAfter = applyDelta(longBefore, result.longTermDelta)
+                    val notesAfter = mergeNotes(notesBefore, result.longTermNotesDelta, limit = 30)
+
+                    val wsAfter = if (!result.workingSummaryDelta.isNullOrBlank()) {
+                        result.workingSummaryDelta.trim()
+                    } else {
+                        wsBefore
                     }
 
-                    longTermNotes = mergeNotes(longTermNotes, r.longTermNotesDelta, limit = 30)
+                    // assign
+                    workingFacts = workingAfter
+                    longTermProfile = longAfter
+                    longTermNotes = notesAfter
+                    workingSummary = wsAfter
+
+                    // ===== AUDIT LOGS =====
+                    println("MEMORY_ROUTER raw=${raw.shrinkForLog(800)}")
+                    println(
+                        "MEMORY_APPLY working: upsert=${result.workingFactsDelta.upsert.keys.sorted()} " +
+                                "remove=${result.workingFactsDelta.remove.sorted()}"
+                    )
+                    println(
+                        "MEMORY_APPLY longTerm: upsert=${result.longTermDelta.upsert.keys.sorted()} " +
+                                "remove=${result.longTermDelta.remove.sorted()}"
+                    )
+                    println(
+                        "MEMORY_APPLY workingSummaryChanged=${!result.workingSummaryDelta.isNullOrBlank()} " +
+                                "longTermNotesAdded=${result.longTermNotesDelta.size}"
+                    )
+                    println("MEMORY_SNAPSHOT workingFactsKeys=${workingAfter.keys.sorted()}")
+                    println("MEMORY_SNAPSHOT longTermKeys=${longAfter.keys.sorted()}")
+                    println("MEMORY_SNAPSHOT longTermNotesCount=${notesAfter.size}")
+                } else {
+                    println("MEMORY_ROUTER parseFailed raw=${raw.shrinkForLog(800)}")
                 }
 
                 sessionDialogueTokensTotal += (usage?.totalTokens ?: 0).toLong()
@@ -218,6 +264,67 @@ class ChatController(
                 isUpdatingFacts = false
             }
         }
+    }
+
+    private suspend fun routeMemoryInternal(
+        userText: String,
+        workingFacts: Map<String, String>,
+        longTermProfile: Map<String, String>,
+        longTermNotes: List<String>
+    ): Triple<MemoryRouterResult?, ResponseUsage?, String> {
+        val model = "gpt-5-mini"
+
+        val prompt = buildString {
+            append("Ты маршрутизируешь память диалога по 3 типам: short-term, working, long-term.\n")
+            append("short-term НЕ трогай (её хранит клиент отдельно).\n")
+            append("Верни JSON с изменениями для working и long-term.\n\n")
+
+            append("Формат ответа: строго JSON без текста вокруг:\n")
+            append("{\n")
+            append("  \"working_facts_delta\": {\"upsert\": {\"key\": \"value\"}, \"remove\": [\"key\"]},\n")
+            append("  \"long_term_delta\": {\"upsert\": {\"key\": \"value\"}, \"remove\": [\"key\"]},\n")
+            append("  \"working_summary_delta\": \"...\" | null,\n")
+            append("  \"long_term_notes_delta\": [\"...\"]\n")
+            append("}\n\n")
+
+            append("Правила:\n")
+            append("- Working: цель/задача, ограничения, требования, план, прогресс, договорённости ТЕКУЩЕЙ задачи.\n")
+            append("- Long-term: стабильные предпочтения/профиль/принципы/повторяющиеся решения.\n")
+            append("- Не выдумывай. Если нечего обновлять — пустые deltas.\n")
+            append("- Ключи: snake_case, короткие. Значения: 1-2 предложения.\n\n")
+
+            append("Текущие working facts:\n")
+            append(workingFacts.entries.sortedBy { it.key }.joinToString("\n") { "${it.key}: ${it.value}" }.ifBlank { "(empty)" })
+            append("\n\nТекущий long-term профиль:\n")
+            append(longTermProfile.entries.sortedBy { it.key }.joinToString("\n") { "${it.key}: ${it.value}" }.ifBlank { "(empty)" })
+            append("\n\nLong-term notes:\n")
+            append(longTermNotes.joinToString("\n").ifBlank { "(empty)" })
+
+            append("\n\nНовое сообщение пользователя:\n")
+            append(userText)
+        }
+
+        val res = client.chat(
+            messages = listOf(
+                ChatMessage("system", "Ты — Memory Router. Отвечай строго JSON."),
+                ChatMessage("user", prompt)
+            ),
+            temperature = null,
+            model = model
+        )
+
+        val raw = res.text
+        val parsed = parseRouterJson(raw)
+        return Triple(parsed, res.usage, raw)
+    }
+
+    private fun parseRouterJson(raw: String): MemoryRouterResult? {
+        val t = raw.trim()
+        val start = t.indexOf('{')
+        val end = t.lastIndexOf('}')
+        if (start < 0 || end <= start) return null
+        val candidate = t.substring(start, end + 1)
+        return runCatching { routerJson.decodeFromString(MemoryRouterResult.serializer(), candidate) }.getOrNull()
     }
 
     // ===== Strategy 0: Legacy summary + window (сохраняем прежнюю логику) =====
@@ -258,6 +365,8 @@ class ChatController(
         trimToWindow(legacyWindow)
         persistAll()
 
+        logRequestSnapshot("LEGACY", shortTermCount = legacyWindow.size)
+
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
         try {
@@ -287,10 +396,12 @@ class ChatController(
         }
     }
 
-    // ===== Strategy 1: Sliding window (short-term only) =====
+    // ===== Strategy 1: Sliding window =====
     private suspend fun sendSliding(userText: String) {
         slidingHistory = (slidingHistory + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
         persistAll()
+
+        logRequestSnapshot("SLIDING", shortTermCount = slidingHistory.size)
 
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
@@ -319,10 +430,12 @@ class ChatController(
         }
     }
 
-    // ===== Strategy 2: Sticky facts (facts = workingFacts; request = facts + last N) =====
+    // ===== Strategy 2: Sticky facts =====
     private suspend fun sendStickyFacts(userText: String) {
         factsHistory = (factsHistory + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
         persistAll()
+
+        logRequestSnapshot("FACTS", shortTermCount = factsHistory.size)
 
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
@@ -357,6 +470,8 @@ class ChatController(
         val newHist = (branch.history + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
         setCurrentBranchState(branch.copy(history = newHist))
         persistAll()
+
+        logRequestSnapshot("BRANCH($currentBranchId)", shortTermCount = newHist.size)
 
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
@@ -409,10 +524,20 @@ class ChatController(
 
     fun factsCountForFooter(): Int = workingFacts.size
     fun branchesCountForFooter(): Int = branches.size
+
+    private fun logRequestSnapshot(tag: String, shortTermCount: Int) {
+        println(
+            "MEMORY_REQUEST [$tag] shortTermCount=$shortTermCount " +
+                    "workingFactsKeys=${workingFacts.keys.sorted()} " +
+                    "longTermKeys=${longTermProfile.keys.sorted()} " +
+                    "longTermNotesCount=${longTermNotes.size} " +
+                    "workingSummaryLen=${workingSummary.length}"
+        )
+    }
 }
 
 /* ===========================
-   Пункт 5: Формирование запросов
+   Формирование запросов (пункт 5)
    =========================== */
 
 private fun buildMemorySystemBlock(
@@ -489,13 +614,12 @@ private fun buildStickyFactsRequestMessages(
     longTermNotes: List<String>,
     historyWindow: List<ChatMessage>
 ): List<ChatMessage> = buildList {
-    // Sticky Facts: явно подчёркиваем, что facts важнее истории
     add(
         ChatMessage(
             "system",
             buildString {
                 append(buildMemorySystemBlock(workingFacts, workingSummary, longTermProfile, longTermNotes))
-                append("\n\nПравило: используй facts/память как источник истины; история — только для локального контекста.\n")
+                append("\n\nПравило: используй рабочие facts/память как источник истины; история — только для локального контекста.\n")
             }.trim()
         )
     )
@@ -573,4 +697,10 @@ private fun uniqueBranchId(branches: Map<String, BranchState>, suffix: String): 
         if (!branches.containsKey(id)) return id
         i++
     }
+}
+
+private fun String.shrinkForLog(max: Int): String {
+    val s = trim()
+    if (s.length <= max) return s
+    return s.take(max) + "…(truncated ${s.length - max})"
 }
