@@ -7,26 +7,25 @@ private const val KEY_CHAT_STATE = "chat_state_v2"
 
 @Serializable
 data class ChatState(
-    // Legacy summary strategy storage
     val summary: String = "",
-    val lastMessages: List<ChatMessage> = emptyList(), // legacy window
+    val lastMessages: List<ChatMessage> = emptyList(),
 
-    // Counters (persisted)
     val totalInputTokens: Long = 0,
     val totalOutputTokens: Long = 0,
     val totalTokens: Long = 0,
 
-    // New: strategy selection
     val strategy: ContextStrategyType = ContextStrategyType.LEGACY_SUMMARY_WINDOW,
 
-    // New: Sliding storage
     val slidingHistory: List<ChatMessage> = emptyList(),
 
-    // New: Sticky Facts storage
-    val facts: Map<String, String> = emptyMap(),
+    val workingFacts: Map<String, String> = emptyMap(),
+    val workingSummary: String = "",
+
+    val longTermProfile: Map<String, String> = emptyMap(),
+    val longTermNotes: List<String> = emptyList(),
+
     val factsHistory: List<ChatMessage> = emptyList(),
 
-    // New: Branching storage
     val branching: BranchingState = BranchingState()
 )
 

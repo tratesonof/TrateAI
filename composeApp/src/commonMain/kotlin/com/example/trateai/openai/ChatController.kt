@@ -37,49 +37,74 @@ class ChatController(
     private val store: ChatStateStore,
     initial: ChatState
 ) {
+    // runtime transcript (как и было)
     val messagesUi = mutableStateListOf<Pair<String, String>>()
 
+    // settings
     var temperature by mutableStateOf(0.7f)
     var selectedModel: ModelSpec by mutableStateOf(MODELS[1])
 
     var strategy by mutableStateOf(initial.strategy)
 
-    var summary by mutableStateOf(initial.summary)
-    val history = mutableStateListOf<ChatMessage>().apply { addAll(initial.lastMessages) }
+    // ===== Memory separation =====
+    // short-term (strategy-specific)
+    var legacySummary by mutableStateOf(initial.summary) // legacy summary mode only
+    val legacyWindow = mutableStateListOf<ChatMessage>().apply { addAll(initial.lastMessages) } // legacy short-term window
 
-    var slidingHistory by mutableStateOf(initial.slidingHistory)
-
-    var facts by mutableStateOf(initial.facts)
-    var factsHistory by mutableStateOf(initial.factsHistory)
-
+    var slidingHistory by mutableStateOf(initial.slidingHistory) // sliding short-term
+    var factsHistory by mutableStateOf(initial.factsHistory)     // facts short-term
     var currentBranchId by mutableStateOf(initial.branching.currentBranchId)
     var branches by mutableStateOf(initial.branching.branches)
     var checkpoint by mutableStateOf<BranchCheckpoint?>(initial.branching.checkpoint)
 
+    // working memory
+    var workingFacts by mutableStateOf(initial.workingFacts)
+    var workingSummary by mutableStateOf(initial.workingSummary)
+
+    // long-term memory
+    var longTermProfile by mutableStateOf(initial.longTermProfile)
+    var longTermNotes by mutableStateOf(initial.longTermNotes)
+
+    // flags
     var isWaitingResponse by mutableStateOf(false)
     var isSummarizing by mutableStateOf(false)
-    var isUpdatingFacts by mutableStateOf(false)
+    var isUpdatingFacts by mutableStateOf(false) // используется UI; теперь это "memory routing"
     var error by mutableStateOf<String?>(null)
 
+    // tokens (persisted)
     var lastRequestInputTokens by mutableStateOf(initial.totalInputTokens)
     var lastResponseOutputTokens by mutableStateOf(initial.totalOutputTokens)
     var sessionDialogueTokensTotal by mutableStateOf(initial.totalTokens)
 
     private var summarizeJob: Job? by mutableStateOf(null)
-    private var factsJob: Job? by mutableStateOf(null)
+    private var memoryJob: Job? by mutableStateOf(null)
 
     fun persistAll() {
         store.save(
             ChatState(
-                summary = summary,
-                lastMessages = history.toList(),
+                // legacy
+                summary = legacySummary,
+                lastMessages = legacyWindow.toList(),
+
+                // counters
                 totalInputTokens = lastRequestInputTokens,
                 totalOutputTokens = lastResponseOutputTokens,
                 totalTokens = sessionDialogueTokensTotal,
+
+                // settings/strategy
                 strategy = strategy,
+
+                // short-term per strategies
                 slidingHistory = slidingHistory,
-                facts = facts,
                 factsHistory = factsHistory,
+
+                // working + long-term
+                workingFacts = workingFacts,
+                workingSummary = workingSummary,
+                longTermProfile = longTermProfile,
+                longTermNotes = longTermNotes,
+
+                // branching
                 branching = BranchingState(
                     currentBranchId = currentBranchId,
                     branches = branches,
@@ -89,15 +114,15 @@ class ChatController(
         )
     }
 
+    fun updateStrategy(value: ContextStrategyType) {
+        strategy = value
+        persistAll()
+    }
+
     fun getCurrentBranch(): BranchState = branches[currentBranchId] ?: BranchState()
 
     private fun setCurrentBranchState(newState: BranchState) {
         branches = branches.toMutableMap().apply { put(currentBranchId, newState) }
-    }
-
-    fun updateStrategy(value: ContextStrategyType) {
-        strategy = value
-        persistAll()
     }
 
     fun switchBranch(id: String) {
@@ -113,13 +138,23 @@ class ChatController(
     fun forkFromCheckpointTwoBranches() {
         val cp = checkpoint ?: return
         val base = cp.state
+
         val aId = uniqueBranchId(branches, "A")
         val bId = uniqueBranchId(branches, "B")
+
         branches = branches.toMutableMap().apply {
             put(aId, base.copy())
             put(bId, base.copy())
         }
         persistAll()
+    }
+
+    fun createNewBranch(): String {
+        val newId = uniqueBranchId(branches, "manual")
+        branches = branches.toMutableMap().apply { put(newId, BranchState()) }
+        currentBranchId = newId
+        persistAll()
+        return newId
     }
 
     fun resetBranching() {
@@ -133,25 +168,65 @@ class ChatController(
 
     fun send(userText: String) {
         if (userText.isBlank() || isWaitingResponse) return
+
         error = null
         messagesUi += "user" to userText
+
+        // явное разнесение: роутим working/long-term отдельно от short-term
+        routeMemoryAfterUser(userText)
 
         scope.launch {
             when (strategy) {
                 ContextStrategyType.LEGACY_SUMMARY_WINDOW -> sendLegacy(userText)
                 ContextStrategyType.SLIDING_WINDOW -> sendSliding(userText)
-                ContextStrategyType.STICKY_FACTS -> sendFacts(userText)
+                ContextStrategyType.STICKY_FACTS -> sendStickyFacts(userText)
                 ContextStrategyType.BRANCHING -> sendBranching(userText)
             }
         }
     }
 
-    private suspend fun sendLegacy(userText: String) {
-        if (history.size >= HISTORY_WINDOW_MESSAGES && (summarizeJob?.isActive != true)) {
-            val chunk = history.toList()
-            val summaryAtStart = summary
+    // ===== Memory Router: working + long-term (явно отдельно) =====
+    private fun routeMemoryAfterUser(userText: String) {
+        if (memoryJob?.isActive == true) return
 
-            history.clear()
+        memoryJob = scope.launch {
+            isUpdatingFacts = true
+            try {
+                val (r, usage) = MemoryRouter.route(
+                    client = client,
+                    userMessage = userText,
+                    assistantMessage = null,
+                    workingFacts = workingFacts,
+                    longTermProfile = longTermProfile,
+                    longTermNotes = longTermNotes
+                )
+
+                if (r != null) {
+                    workingFacts = applyDelta(workingFacts, r.workingFactsDelta)
+                    longTermProfile = applyDelta(longTermProfile, r.longTermDelta)
+
+                    if (!r.workingSummaryDelta.isNullOrBlank()) {
+                        workingSummary = r.workingSummaryDelta.trim()
+                    }
+
+                    longTermNotes = mergeNotes(longTermNotes, r.longTermNotesDelta, limit = 30)
+                }
+
+                sessionDialogueTokensTotal += (usage?.totalTokens ?: 0).toLong()
+                persistAll()
+            } finally {
+                isUpdatingFacts = false
+            }
+        }
+    }
+
+    // ===== Strategy 0: Legacy summary + window (сохраняем прежнюю логику) =====
+    private suspend fun sendLegacy(userText: String) {
+        if (legacyWindow.size >= HISTORY_WINDOW_MESSAGES && (summarizeJob?.isActive != true)) {
+            val chunk = legacyWindow.toList()
+            val summaryAtStart = legacySummary
+
+            legacyWindow.clear()
             persistAll()
 
             summarizeJob = scope.launch {
@@ -159,18 +234,18 @@ class ChatController(
                 try {
                     val sumRes = summarizeChunkWithUsage(client, summaryAtStart, chunk)
 
-                    val currentNow = summary
-                    summary = if (currentNow == summaryAtStart) {
+                    val currentNow = legacySummary
+                    legacySummary = if (currentNow == summaryAtStart) {
                         sumRes.text
                     } else {
                         summarizeChunkWithUsage(client, currentNow, chunk).text
                     }
 
-                    val sumTotal = (sumRes.usage?.totalTokens ?: 0).toLong()
-                    sessionDialogueTokensTotal += sumTotal
-                    persistAll()
+                    // legacy summary логически = рабочий summary текущей задачи
+                    workingSummary = legacySummary
 
-                    println("OPENAI summarize tokensTotal=$sumTotal sessionTokensTotal=$sessionDialogueTokensTotal")
+                    sessionDialogueTokensTotal += (sumRes.usage?.totalTokens ?: 0).toLong()
+                    persistAll()
                 } catch (t: Throwable) {
                     println("OPENAI summarize error: ${t.message ?: t}")
                 } finally {
@@ -179,16 +254,22 @@ class ChatController(
             }
         }
 
-        history += ChatMessage("user", userText)
-        trimHistoryToWindow(history)
+        legacyWindow += ChatMessage("user", userText)
+        trimToWindow(legacyWindow)
         persistAll()
 
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
-
         try {
             val result = client.chat(
-                messages = buildLegacyRequestMessages(summary, history),
+                messages = buildLegacyRequestMessages(
+                    legacySummary = legacySummary,
+                    workingFacts = workingFacts,
+                    workingSummary = workingSummary,
+                    longTermProfile = longTermProfile,
+                    longTermNotes = longTermNotes,
+                    historyWindow = legacyWindow
+                ),
                 temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
                 model = selectedModel.id
             )
@@ -196,8 +277,8 @@ class ChatController(
             applyUsageAndLog(result, started)
             messagesUi += "assistant" to result.text
 
-            history += ChatMessage("assistant", result.text)
-            trimHistoryToWindow(history)
+            legacyWindow += ChatMessage("assistant", result.text)
+            trimToWindow(legacyWindow)
             persistAll()
         } catch (t: Throwable) {
             error = t.message ?: t.toString()
@@ -206,16 +287,22 @@ class ChatController(
         }
     }
 
+    // ===== Strategy 1: Sliding window (short-term only) =====
     private suspend fun sendSliding(userText: String) {
         slidingHistory = (slidingHistory + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
         persistAll()
 
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
-
         try {
             val result = client.chat(
-                messages = buildSlidingRequestMessages(slidingHistory),
+                messages = buildSlidingRequestMessages(
+                    workingFacts = workingFacts,
+                    workingSummary = workingSummary,
+                    longTermProfile = longTermProfile,
+                    longTermNotes = longTermNotes,
+                    historyWindow = slidingHistory
+                ),
                 temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
                 model = selectedModel.id
             )
@@ -232,31 +319,22 @@ class ChatController(
         }
     }
 
-    private suspend fun sendFacts(userText: String) {
-        if (factsJob?.isActive != true) {
-            factsJob = scope.launch {
-                isUpdatingFacts = true
-                try {
-                    val upd = updateFactsWithUsage(client, facts, userText)
-                    facts = upd.facts
-                    sessionDialogueTokensTotal += (upd.usage?.totalTokens ?: 0).toLong()
-                    persistAll()
-                } catch (_: Throwable) {
-                } finally {
-                    isUpdatingFacts = false
-                }
-            }
-        }
-
+    // ===== Strategy 2: Sticky facts (facts = workingFacts; request = facts + last N) =====
+    private suspend fun sendStickyFacts(userText: String) {
         factsHistory = (factsHistory + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
         persistAll()
 
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
-
         try {
             val result = client.chat(
-                messages = buildFactsRequestMessages(facts, factsHistory),
+                messages = buildStickyFactsRequestMessages(
+                    workingFacts = workingFacts,
+                    workingSummary = workingSummary,
+                    longTermProfile = longTermProfile,
+                    longTermNotes = longTermNotes,
+                    historyWindow = factsHistory
+                ),
                 temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
                 model = selectedModel.id
             )
@@ -273,6 +351,7 @@ class ChatController(
         }
     }
 
+    // ===== Strategy 3: Branching =====
     private suspend fun sendBranching(userText: String) {
         val branch = getCurrentBranch()
         val newHist = (branch.history + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
@@ -281,10 +360,16 @@ class ChatController(
 
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
-
         try {
             val result = client.chat(
-                messages = buildBranchingRequestMessages(currentBranchId, newHist),
+                messages = buildBranchingRequestMessages(
+                    branchId = currentBranchId,
+                    workingFacts = workingFacts,
+                    workingSummary = workingSummary,
+                    longTermProfile = longTermProfile,
+                    longTermNotes = longTermNotes,
+                    historyWindow = newHist
+                ),
                 temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
                 model = selectedModel.id
             )
@@ -316,69 +401,134 @@ class ChatController(
     }
 
     fun historySizeForFooter(): Int = when (strategy) {
-        ContextStrategyType.LEGACY_SUMMARY_WINDOW -> history.size
+        ContextStrategyType.LEGACY_SUMMARY_WINDOW -> legacyWindow.size
         ContextStrategyType.SLIDING_WINDOW -> slidingHistory.size
         ContextStrategyType.STICKY_FACTS -> factsHistory.size
         ContextStrategyType.BRANCHING -> getCurrentBranch().history.size
     }
 
-    fun factsCountForFooter(): Int = facts.size
+    fun factsCountForFooter(): Int = workingFacts.size
     fun branchesCountForFooter(): Int = branches.size
 }
 
-/** Helpers */
+/* ===========================
+   Пункт 5: Формирование запросов
+   =========================== */
 
-private fun buildLegacyRequestMessages(summary: String, historyWindow: List<ChatMessage>): List<ChatMessage> =
-    buildList {
-        add(
-            ChatMessage(
-                role = "system",
-                content = buildString {
-                    append("Ты полезный ассистент. Отвечай кратко и по делу.\n")
-                    if (summary.isNotBlank()) {
-                        append("\nКонтекст (summary):\n")
-                        append(summary)
-                    }
+private fun buildMemorySystemBlock(
+    workingFacts: Map<String, String>,
+    workingSummary: String,
+    longTermProfile: Map<String, String>,
+    longTermNotes: List<String>
+): String = buildString {
+    append("Ты полезный ассистент. Отвечай кратко и по делу.\n")
+
+    if (longTermProfile.isNotEmpty() || longTermNotes.isNotEmpty()) {
+        append("\nДолговременная память (profile):\n")
+        longTermProfile.entries.sortedBy { it.key }.forEach { (k, v) ->
+            append("- ").append(k).append(": ").append(v).append("\n")
+        }
+        if (longTermNotes.isNotEmpty()) {
+            append("\nДолговременные заметки:\n")
+            longTermNotes.takeLast(10).forEach { note ->
+                append("- ").append(note).append("\n")
+            }
+        }
+    }
+
+    if (workingFacts.isNotEmpty() || workingSummary.isNotBlank()) {
+        append("\nРабочая память (текущая задача):\n")
+        workingFacts.entries.sortedBy { it.key }.forEach { (k, v) ->
+            append("- ").append(k).append(": ").append(v).append("\n")
+        }
+        if (workingSummary.isNotBlank()) {
+            append("\nРабочее summary:\n")
+            append(workingSummary).append("\n")
+        }
+    }
+}.trim()
+
+private fun buildLegacyRequestMessages(
+    legacySummary: String,
+    workingFacts: Map<String, String>,
+    workingSummary: String,
+    longTermProfile: Map<String, String>,
+    longTermNotes: List<String>,
+    historyWindow: List<ChatMessage>
+): List<ChatMessage> = buildList {
+    add(
+        ChatMessage(
+            role = "system",
+            content = buildString {
+                append(buildMemorySystemBlock(workingFacts, workingSummary, longTermProfile, longTermNotes))
+                if (legacySummary.isNotBlank()) {
+                    append("\n\nКонтекст (legacy summary):\n")
+                    append(legacySummary)
                 }
-            )
+            }.trim()
         )
-        addAll(historyWindow)
-    }
+    )
+    addAll(historyWindow)
+}
 
-private fun buildSlidingRequestMessages(historyWindow: List<ChatMessage>): List<ChatMessage> =
-    buildList {
-        add(ChatMessage("system", "Ты полезный ассистент. Отвечай кратко и по делу."))
-        addAll(historyWindow)
-    }
+private fun buildSlidingRequestMessages(
+    workingFacts: Map<String, String>,
+    workingSummary: String,
+    longTermProfile: Map<String, String>,
+    longTermNotes: List<String>,
+    historyWindow: List<ChatMessage>
+): List<ChatMessage> = buildList {
+    add(ChatMessage("system", buildMemorySystemBlock(workingFacts, workingSummary, longTermProfile, longTermNotes)))
+    addAll(historyWindow)
+}
 
-private fun buildFactsRequestMessages(facts: Map<String, String>, historyWindow: List<ChatMessage>): List<ChatMessage> =
-    buildList {
-        add(
-            ChatMessage(
-                "system",
-                buildString {
-                    append("Ты полезный ассистент. Отвечай кратко и по делу.\n")
-                    if (facts.isNotEmpty()) {
-                        append("\nFacts (key-value memory):\n")
-                        facts.entries.sortedBy { it.key }.forEach { (k, v) ->
-                            append("- ").append(k).append(": ").append(v).append("\n")
-                        }
-                    }
-                }.trim()
-            )
+private fun buildStickyFactsRequestMessages(
+    workingFacts: Map<String, String>,
+    workingSummary: String,
+    longTermProfile: Map<String, String>,
+    longTermNotes: List<String>,
+    historyWindow: List<ChatMessage>
+): List<ChatMessage> = buildList {
+    // Sticky Facts: явно подчёркиваем, что facts важнее истории
+    add(
+        ChatMessage(
+            "system",
+            buildString {
+                append(buildMemorySystemBlock(workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append("\n\nПравило: используй facts/память как источник истины; история — только для локального контекста.\n")
+            }.trim()
         )
-        addAll(historyWindow)
-    }
+    )
+    addAll(historyWindow)
+}
 
-private fun buildBranchingRequestMessages(branchId: String, historyWindow: List<ChatMessage>): List<ChatMessage> =
-    buildList {
-        add(ChatMessage("system", "Ты полезный ассистент. Ветка диалога: $branchId. Отвечай кратко и по делу."))
-        addAll(historyWindow)
-    }
+private fun buildBranchingRequestMessages(
+    branchId: String,
+    workingFacts: Map<String, String>,
+    workingSummary: String,
+    longTermProfile: Map<String, String>,
+    longTermNotes: List<String>,
+    historyWindow: List<ChatMessage>
+): List<ChatMessage> = buildList {
+    add(
+        ChatMessage(
+            "system",
+            buildString {
+                append(buildMemorySystemBlock(workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append("\n\nВетка диалога: ").append(branchId).append("\n")
+            }.trim()
+        )
+    )
+    addAll(historyWindow)
+}
 
-private fun trimHistoryToWindow(history: MutableList<ChatMessage>) {
-    if (history.size <= HISTORY_WINDOW_MESSAGES) return
-    repeat(history.size - HISTORY_WINDOW_MESSAGES) { history.removeAt(0) }
+/* ===========================
+   Internal helpers
+   =========================== */
+
+private fun trimToWindow(list: MutableList<ChatMessage>) {
+    if (list.size <= HISTORY_WINDOW_MESSAGES) return
+    repeat(list.size - HISTORY_WINDOW_MESSAGES) { list.removeAt(0) }
 }
 
 private data class SummaryResult(val text: String, val usage: ResponseUsage?)
@@ -416,47 +566,10 @@ private suspend fun summarizeChunkWithUsage(
     return SummaryResult(text = res.text.trim(), usage = res.usage)
 }
 
-private data class FactsUpdateResult(val facts: Map<String, String>, val usage: ResponseUsage?)
-
-private suspend fun updateFactsWithUsage(
-    client: OpenAiClient,
-    currentFacts: Map<String, String>,
-    lastUserMessage: String
-): FactsUpdateResult {
-    val model = "gpt-5-mini"
-    val prompt = buildString {
-        append("Обнови key-value память facts на основе нового сообщения пользователя.\n")
-        append("Верни строго JSON без текста вокруг в формате:\n")
-        append("{\"facts\": {\"key\": \"value\", ...}}\n")
-        append("Правила:\n")
-        append("- ключи короткие (snake_case)\n")
-        append("- значения короткие (1-2 предложения)\n")
-        append("- не выдумывай\n")
-        append("- если факт устарел — перезапиши\n")
-        append("- если факт не важен — не добавляй\n\n")
-        append("Текущие facts:\n")
-        append(currentFacts.entries.sortedBy { it.key }.joinToString("\n") { "${it.key}: ${it.value}" }.ifBlank { "(empty)" })
-        append("\n\nНовое сообщение пользователя:\n")
-        append(lastUserMessage)
-    }
-
-    val res = client.chat(
-        messages = listOf(
-            ChatMessage("system", "Ты ведёшь компактную память фактов в формате key-value."),
-            ChatMessage("user", prompt)
-        ),
-        temperature = null,
-        model = model
-    )
-
-    val parsed = FactsJsonParser.tryParseFacts(res.text) ?: currentFacts
-    return FactsUpdateResult(facts = parsed, usage = res.usage)
-}
-
 private fun uniqueBranchId(branches: Map<String, BranchState>, suffix: String): String {
     var i = 1
     while (true) {
-        val id = "branch_$suffix$i"
+        val id = "branch_${suffix}_$i"
         if (!branches.containsKey(id)) return id
         i++
     }
