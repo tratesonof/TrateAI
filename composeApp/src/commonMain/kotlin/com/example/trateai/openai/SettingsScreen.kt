@@ -1,12 +1,38 @@
 package com.example.trateai.openai
 
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ElevatedCard
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -46,6 +72,105 @@ fun SettingsScreen(
                             value = controller.strategy,
                             onChange = { controller.updateStrategy(it) }
                         )
+                    }
+                }
+            }
+
+            // ===== Profiles =====
+            item {
+                ElevatedCard(shape = RoundedCornerShape(16.dp)) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("User profile", style = MaterialTheme.typography.titleMedium)
+
+                        var expanded by remember { mutableStateOf(false) }
+                        var showCreate by remember { mutableStateOf(false) }
+                        var showEdit by remember { mutableStateOf(false) }
+
+                        val profiles = controller.userProfiles
+                        val selected = controller.selectedProfile()
+
+                        ExposedDropdownMenuBox(
+                            expanded = expanded,
+                            onExpandedChange = { expanded = !expanded }
+                        ) {
+                            OutlinedTextField(
+                                modifier = Modifier.menuAnchor().fillMaxWidth(),
+                                value = selected?.title.orEmpty(),
+                                onValueChange = {},
+                                readOnly = true,
+                                singleLine = true,
+                                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) }
+                            )
+
+                            ExposedDropdownMenu(
+                                expanded = expanded,
+                                onDismissRequest = { expanded = false }
+                            ) {
+                                profiles.forEach { p ->
+                                    DropdownMenuItem(
+                                        text = { Text(p.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                        onClick = {
+                                            expanded = false
+                                            controller.setSelectedProfile(p.id)
+                                        }
+                                    )
+                                }
+                            }
+                        }
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { showCreate = true }) { Text("Create") }
+                            OutlinedButton(
+                                enabled = selected != null,
+                                onClick = { showEdit = true }
+                            ) { Text("Edit") }
+                            OutlinedButton(
+                                enabled = selected?.isBuiltIn == false,
+                                onClick = { selected?.let { controller.deleteProfile(it.id) } }
+                            ) { Text("Delete") }
+                        }
+
+                        Text(
+                            text = "Профиль прокидывается в каждый запрос (system prompt).",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        if (showCreate) {
+                            ProfileEditorDialog(
+                                title = "Create profile",
+                                initial = UserProfile(
+                                    id = "tmp",
+                                    title = "",
+                                    isBuiltIn = false
+                                ),
+                                confirmText = "Create",
+                                onDismiss = { showCreate = false },
+                                onConfirm = { draft ->
+                                    controller.createProfile(draft)
+                                    showCreate = false
+                                }
+                            )
+                        }
+
+                        if (showEdit && selected != null) {
+                            ProfileEditorDialog(
+                                title = "Edit profile",
+                                initial = selected,
+                                confirmText = "Save",
+                                onDismiss = { showEdit = false },
+                                onConfirm = { draft ->
+                                    if (selected.isBuiltIn) {
+                                        // built-in нельзя редактировать напрямую -> создаём кастомную копию
+                                        controller.createProfile(draft.copy(id = "tmp", isBuiltIn = false))
+                                    } else {
+                                        controller.upsertProfile(draft.copy(id = selected.id, isBuiltIn = false))
+                                        controller.setSelectedProfile(selected.id)
+                                    }
+                                    showEdit = false
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -179,4 +304,80 @@ private fun StrategySelector(
             )
         }
     }
+}
+
+@Composable
+private fun ProfileEditorDialog(
+    title: String,
+    initial: UserProfile,
+    confirmText: String,
+    onDismiss: () -> Unit,
+    onConfirm: (UserProfile) -> Unit
+) {
+    var t by remember { mutableStateOf(initial.title) }
+    var style by remember { mutableStateOf(initial.style) }
+    var format by remember { mutableStateOf(initial.format) }
+    var constraints by remember { mutableStateOf(initial.constraints) }
+    var systemPrompt by remember { mutableStateOf(initial.systemPrompt) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = t,
+                    onValueChange = { t = it },
+                    label = { Text("Title") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = style,
+                    onValueChange = { style = it },
+                    label = { Text("Style") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = format,
+                    onValueChange = { format = it },
+                    label = { Text("Format") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = constraints,
+                    onValueChange = { constraints = it },
+                    label = { Text("Constraints") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = systemPrompt,
+                    onValueChange = { systemPrompt = it },
+                    label = { Text("System prompt") },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 3
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = t.isNotBlank(),
+                onClick = {
+                    onConfirm(
+                        initial.copy(
+                            title = t.trim(),
+                            style = style.trim(),
+                            format = format.trim(),
+                            constraints = constraints.trim(),
+                            systemPrompt = systemPrompt.trim(),
+                            isBuiltIn = initial.isBuiltIn
+                        )
+                    )
+                }
+            ) { Text(confirmText) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }

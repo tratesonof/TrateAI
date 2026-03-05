@@ -26,7 +26,10 @@ data class ChatState(
 
     val factsHistory: List<ChatMessage> = emptyList(),
 
-    val branching: BranchingState = BranchingState()
+    val branching: BranchingState = BranchingState(),
+
+    val userProfiles: List<UserProfile> = emptyList(),
+    val selectedProfileId: String = DEFAULT_PROFILE_FUN
 )
 
 @Serializable
@@ -53,6 +56,51 @@ data class BranchingState(
     val currentBranchId: String = "main",
     val branches: Map<String, BranchState> = mapOf("main" to BranchState()),
     val checkpoint: BranchCheckpoint? = null
+)
+
+@Serializable
+data class UserProfile(
+    val id: String,
+    val title: String,
+    val style: String = "",
+    val format: String = "",
+    val constraints: String = "",
+    val systemPrompt: String = "",
+    val isBuiltIn: Boolean = false
+)
+
+const val DEFAULT_PROFILE_FUN = "profile_fun"
+const val DEFAULT_PROFILE_FACTS = "profile_facts"
+const val DEFAULT_PROFILE_CLARIFY = "profile_clarify"
+
+fun defaultProfiles(): List<UserProfile> = listOf(
+    UserProfile(
+        id = DEFAULT_PROFILE_FUN,
+        title = "Весёлый 😄",
+        style = "Дружелюбный, лёгкий, позитивный тон.",
+        format = "Коротко, по делу. Можно списками.",
+        constraints = "Добавляй уместные эмодзи. Не перегружай.",
+        systemPrompt = "Пиши дружелюбно, допускаются эмодзи. Без токсичности, без лишней болтовни.",
+        isBuiltIn = true
+    ),
+    UserProfile(
+        id = DEFAULT_PROFILE_FACTS,
+        title = "Только факты",
+        style = "Нейтральный, безэмоциональный тон.",
+        format = "Структура: факты → выводы (если нужны) → шаги.",
+        constraints = "Без эмоций, без оценочных суждений, без метафор.",
+        systemPrompt = "Отвечай строго фактически. Без эмоций и без субъективных оценок. Если данных недостаточно — перечисли, чего не хватает.",
+        isBuiltIn = true
+    ),
+    UserProfile(
+        id = DEFAULT_PROFILE_CLARIFY,
+        title = "Уточняющий",
+        style = "Нейтрально, прагматично.",
+        format = "Сначала 1 уточняющий вопрос, затем краткий ответ на основе допущений.",
+        constraints = "Всегда задай минимум 1 уточняющий вопрос перед тем, как предлагать финальное решение.",
+        systemPrompt = "Перед финальным ответом задай минимум один уточняющий вопрос. Если можешь — параллельно дай краткий ответ с допущениями.",
+        isBuiltIn = true
+    )
 )
 
 class ChatStateStore(

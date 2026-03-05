@@ -1,10 +1,17 @@
 package com.example.trateai.openai
 
-import androidx.compose.runtime.*
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
+import kotlin.time.Clock
 import kotlin.time.TimeSource
 
 private const val HISTORY_WINDOW_MESSAGES = 6
@@ -45,6 +52,66 @@ class ChatController(
     var temperature by mutableStateOf(0.7f)
     var selectedModel: ModelSpec by mutableStateOf(MODELS[1])
     var strategy by mutableStateOf(initial.strategy)
+
+    // ===== Profiles =====
+    var userProfiles by mutableStateOf(ensureProfiles(initial.userProfiles))
+    var selectedProfileId by mutableStateOf(
+        initial.selectedProfileId.takeIf { id -> userProfiles.any { it.id == id } }
+            ?: userProfiles.firstOrNull()?.id
+            ?: DEFAULT_PROFILE_FUN
+    )
+
+    fun selectedProfile(): UserProfile? = userProfiles.firstOrNull { it.id == selectedProfileId }
+
+    fun setSelectedProfile(id: String) {
+        selectedProfileId = id
+        persistAll()
+        println("PROFILE_UI selected=$id")
+    }
+
+    fun createProfile(draft: UserProfile): String {
+        val id = "profile_custom_${Clock.System.now()}"
+        val created = draft.copy(id = id, isBuiltIn = false)
+        upsertProfile(created)
+        setSelectedProfile(id)
+        return id
+    }
+
+    fun upsertProfile(p: UserProfile) {
+        userProfiles = userProfiles.toMutableList().apply {
+            val idx = indexOfFirst { it.id == p.id }
+            if (idx >= 0) set(idx, p) else add(p)
+        }.sortedWith(compareBy<UserProfile> { !it.isBuiltIn }.thenBy { it.title })
+
+        if (userProfiles.none { it.id == selectedProfileId }) {
+            selectedProfileId = userProfiles.firstOrNull()?.id ?: DEFAULT_PROFILE_FUN
+        }
+        persistAll()
+        println("PROFILE_UI upsert id=${p.id} builtIn=${p.isBuiltIn}")
+    }
+
+    fun deleteProfile(id: String) {
+        val target = userProfiles.firstOrNull { it.id == id } ?: return
+        if (target.isBuiltIn) return
+
+        userProfiles = userProfiles.filterNot { it.id == id }
+        if (selectedProfileId == id) {
+            selectedProfileId = userProfiles.firstOrNull()?.id ?: DEFAULT_PROFILE_FUN
+        }
+        persistAll()
+        println("PROFILE_UI delete id=$id")
+    }
+
+    private fun ensureProfiles(existing: List<UserProfile>): List<UserProfile> {
+        val builtIns = defaultProfiles()
+        if (existing.isEmpty()) {
+            return builtIns.sortedWith(compareBy<UserProfile> { !it.isBuiltIn }.thenBy { it.title })
+        }
+
+        val map = existing.associateBy { it.id }.toMutableMap()
+        builtIns.forEach { map[it.id] = it }
+        return map.values.sortedWith(compareBy<UserProfile> { !it.isBuiltIn }.thenBy { it.title })
+    }
 
     // ===== Memory separation =====
     // short-term (strategy-specific)
@@ -91,6 +158,13 @@ class ChatController(
         isLenient = true
     }
 
+    init {
+        // миграция: если в сохранённом состоянии нет профилей — появятся built-in, и сохраним.
+        if (initial.userProfiles.isEmpty()) {
+            persistAll()
+        }
+    }
+
     fun persistAll() {
         store.save(
             ChatState(
@@ -115,7 +189,10 @@ class ChatController(
                     currentBranchId = currentBranchId,
                     branches = branches,
                     checkpoint = checkpoint
-                )
+                ),
+
+                userProfiles = userProfiles,
+                selectedProfileId = selectedProfileId
             )
         )
     }
@@ -367,11 +444,13 @@ class ChatController(
 
         logRequestSnapshot("LEGACY", shortTermCount = legacyWindow.size)
 
+        val profile = selectedProfile()
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
         try {
             val result = client.chat(
                 messages = buildLegacyRequestMessages(
+                    profile = profile,
                     legacySummary = legacySummary,
                     workingFacts = workingFacts,
                     workingSummary = workingSummary,
@@ -403,11 +482,13 @@ class ChatController(
 
         logRequestSnapshot("SLIDING", shortTermCount = slidingHistory.size)
 
+        val profile = selectedProfile()
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
         try {
             val result = client.chat(
                 messages = buildSlidingRequestMessages(
+                    profile = profile,
                     workingFacts = workingFacts,
                     workingSummary = workingSummary,
                     longTermProfile = longTermProfile,
@@ -437,11 +518,13 @@ class ChatController(
 
         logRequestSnapshot("FACTS", shortTermCount = factsHistory.size)
 
+        val profile = selectedProfile()
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
         try {
             val result = client.chat(
                 messages = buildStickyFactsRequestMessages(
+                    profile = profile,
                     workingFacts = workingFacts,
                     workingSummary = workingSummary,
                     longTermProfile = longTermProfile,
@@ -473,11 +556,13 @@ class ChatController(
 
         logRequestSnapshot("BRANCH($currentBranchId)", shortTermCount = newHist.size)
 
+        val profile = selectedProfile()
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
         try {
             val result = client.chat(
                 messages = buildBranchingRequestMessages(
+                    profile = profile,
                     branchId = currentBranchId,
                     workingFacts = workingFacts,
                     workingSummary = workingSummary,
@@ -531,22 +616,36 @@ class ChatController(
                     "workingFactsKeys=${workingFacts.keys.sorted()} " +
                     "longTermKeys=${longTermProfile.keys.sorted()} " +
                     "longTermNotesCount=${longTermNotes.size} " +
-                    "workingSummaryLen=${workingSummary.length}"
+                    "workingSummaryLen=${workingSummary.length} " +
+                    "profileId=$selectedProfileId"
         )
     }
 }
 
 /* ===========================
-   Формирование запросов (пункт 5)
+   Формирование запросов
    =========================== */
 
 private fun buildMemorySystemBlock(
+    profile: UserProfile?,
     workingFacts: Map<String, String>,
     workingSummary: String,
     longTermProfile: Map<String, String>,
     longTermNotes: List<String>
 ): String = buildString {
-    append("Ты полезный ассистент. Отвечай кратко и по делу.\n")
+    append("Ты полезный ассистент.\n")
+
+    if (profile != null) {
+        append("\nПрофиль пользователя:\n")
+        append("- title: ").append(profile.title).append("\n")
+        if (profile.style.isNotBlank()) append("- style: ").append(profile.style.trim()).append("\n")
+        if (profile.format.isNotBlank()) append("- format: ").append(profile.format.trim()).append("\n")
+        if (profile.constraints.isNotBlank()) append("- constraints: ").append(profile.constraints.trim()).append("\n")
+        if (profile.systemPrompt.isNotBlank()) {
+            append("\nСистемные инструкции профиля:\n")
+            append(profile.systemPrompt.trim()).append("\n")
+        }
+    }
 
     if (longTermProfile.isNotEmpty() || longTermNotes.isNotEmpty()) {
         append("\nДолговременная память (profile):\n")
@@ -574,6 +673,7 @@ private fun buildMemorySystemBlock(
 }.trim()
 
 private fun buildLegacyRequestMessages(
+    profile: UserProfile?,
     legacySummary: String,
     workingFacts: Map<String, String>,
     workingSummary: String,
@@ -585,7 +685,7 @@ private fun buildLegacyRequestMessages(
         ChatMessage(
             role = "system",
             content = buildString {
-                append(buildMemorySystemBlock(workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append(buildMemorySystemBlock(profile, workingFacts, workingSummary, longTermProfile, longTermNotes))
                 if (legacySummary.isNotBlank()) {
                     append("\n\nКонтекст (legacy summary):\n")
                     append(legacySummary)
@@ -597,17 +697,19 @@ private fun buildLegacyRequestMessages(
 }
 
 private fun buildSlidingRequestMessages(
+    profile: UserProfile?,
     workingFacts: Map<String, String>,
     workingSummary: String,
     longTermProfile: Map<String, String>,
     longTermNotes: List<String>,
     historyWindow: List<ChatMessage>
 ): List<ChatMessage> = buildList {
-    add(ChatMessage("system", buildMemorySystemBlock(workingFacts, workingSummary, longTermProfile, longTermNotes)))
+    add(ChatMessage("system", buildMemorySystemBlock(profile, workingFacts, workingSummary, longTermProfile, longTermNotes)))
     addAll(historyWindow)
 }
 
 private fun buildStickyFactsRequestMessages(
+    profile: UserProfile?,
     workingFacts: Map<String, String>,
     workingSummary: String,
     longTermProfile: Map<String, String>,
@@ -618,7 +720,7 @@ private fun buildStickyFactsRequestMessages(
         ChatMessage(
             "system",
             buildString {
-                append(buildMemorySystemBlock(workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append(buildMemorySystemBlock(profile, workingFacts, workingSummary, longTermProfile, longTermNotes))
                 append("\n\nПравило: используй рабочие facts/память как источник истины; история — только для локального контекста.\n")
             }.trim()
         )
@@ -627,6 +729,7 @@ private fun buildStickyFactsRequestMessages(
 }
 
 private fun buildBranchingRequestMessages(
+    profile: UserProfile?,
     branchId: String,
     workingFacts: Map<String, String>,
     workingSummary: String,
@@ -638,7 +741,7 @@ private fun buildBranchingRequestMessages(
         ChatMessage(
             "system",
             buildString {
-                append(buildMemorySystemBlock(workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append(buildMemorySystemBlock(profile, workingFacts, workingSummary, longTermProfile, longTermNotes))
                 append("\n\nВетка диалога: ").append(branchId).append("\n")
             }.trim()
         )
