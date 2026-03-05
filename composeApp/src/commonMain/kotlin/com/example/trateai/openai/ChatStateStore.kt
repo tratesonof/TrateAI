@@ -28,8 +28,12 @@ data class ChatState(
 
     val branching: BranchingState = BranchingState(),
 
+    // ===== User Profiles =====
     val userProfiles: List<UserProfile> = emptyList(),
-    val selectedProfileId: String = DEFAULT_PROFILE_FUN
+    val selectedProfileId: String = DEFAULT_PROFILE_FUN,
+
+    // ===== Task FSM =====
+    val taskFsm: TaskFsmState = TaskFsmState()
 )
 
 @Serializable
@@ -57,6 +61,8 @@ data class BranchingState(
     val branches: Map<String, BranchState> = mapOf("main" to BranchState()),
     val checkpoint: BranchCheckpoint? = null
 )
+
+// ===== Profiles =====
 
 @Serializable
 data class UserProfile(
@@ -101,6 +107,21 @@ fun defaultProfiles(): List<UserProfile> = listOf(
         systemPrompt = "Перед финальным ответом задай минимум один уточняющий вопрос. Если можешь — параллельно дай краткий ответ с допущениями.",
         isBuiltIn = true
     )
+)
+
+// ===== Task FSM =====
+
+@Serializable
+enum class TaskPhase {
+    PLANNING, EXECUTION, VALIDATION, DONE
+}
+
+@Serializable
+data class TaskFsmState(
+    val phase: TaskPhase = TaskPhase.PLANNING,
+    val currentStep: String = "",
+    val expectedAction: String = "",
+    val isPaused: Boolean = false
 )
 
 class ChatStateStore(

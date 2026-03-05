@@ -1,16 +1,17 @@
 package com.example.trateai.openai
 
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Clock
 import kotlin.time.TimeSource
 
@@ -45,7 +46,7 @@ class ChatController(
     private val store: ChatStateStore,
     initial: ChatState
 ) {
-    // runtime transcript (как и было)
+    // runtime transcript
     val messagesUi = mutableStateListOf<Pair<String, String>>()
 
     // settings
@@ -70,8 +71,12 @@ class ChatController(
     }
 
     fun createProfile(draft: UserProfile): String {
-        val id = "profile_custom_${Clock.System.now()}"
-        val created = draft.copy(id = id, isBuiltIn = false)
+        val id = "profile_custom_${nowMillis()}"
+        val created = draft.copy(
+            id = id,
+            title = draft.title.trim(),
+            isBuiltIn = false
+        )
         upsertProfile(created)
         setSelectedProfile(id)
         return id
@@ -93,7 +98,6 @@ class ChatController(
     fun deleteProfile(id: String) {
         val target = userProfiles.firstOrNull { it.id == id } ?: return
         if (target.isBuiltIn) return
-
         userProfiles = userProfiles.filterNot { it.id == id }
         if (selectedProfileId == id) {
             selectedProfileId = userProfiles.firstOrNull()?.id ?: DEFAULT_PROFILE_FUN
@@ -107,13 +111,15 @@ class ChatController(
         if (existing.isEmpty()) {
             return builtIns.sortedWith(compareBy<UserProfile> { !it.isBuiltIn }.thenBy { it.title })
         }
-
         val map = existing.associateBy { it.id }.toMutableMap()
         builtIns.forEach { map[it.id] = it }
         return map.values.sortedWith(compareBy<UserProfile> { !it.isBuiltIn }.thenBy { it.title })
     }
 
-    // ===== Memory separation =====
+    // ===== Task FSM =====
+    var taskFsm by mutableStateOf(initial.taskFsm)
+    private var taskStateJob: Job? by mutableStateOf(null)
+
     // short-term (strategy-specific)
     var legacySummary by mutableStateOf(initial.summary)
     val legacyWindow = mutableStateListOf<ChatMessage>().apply { addAll(initial.lastMessages) }
@@ -136,7 +142,6 @@ class ChatController(
     // flags
     var isWaitingResponse by mutableStateOf(false)
     var isSummarizing by mutableStateOf(false)
-    // UI ранее называлось UpdatingFacts — теперь используем этот флаг как "Routing memory"
     var isUpdatingFacts by mutableStateOf(false)
     var error by mutableStateOf<String?>(null)
 
@@ -145,12 +150,14 @@ class ChatController(
     var lastResponseOutputTokens by mutableStateOf(initial.totalOutputTokens)
     var sessionDialogueTokensTotal by mutableStateOf(initial.totalTokens)
 
-    // ===== Debug/Audit: чтобы понимать, что попадает в каждый слой =====
+    // audit
     var lastMemoryRouterRaw by mutableStateOf<String?>(null)
     var lastMemoryRouterApplied by mutableStateOf<MemoryRouterResult?>(null)
 
     private var summarizeJob: Job? by mutableStateOf(null)
     private var memoryJob: Job? by mutableStateOf(null)
+
+    private var requestJob: Job? by mutableStateOf(null)
 
     private val routerJson = Json {
         ignoreUnknownKeys = true
@@ -159,10 +166,7 @@ class ChatController(
     }
 
     init {
-        // миграция: если в сохранённом состоянии нет профилей — появятся built-in, и сохраним.
-        if (initial.userProfiles.isEmpty()) {
-            persistAll()
-        }
+        if (initial.userProfiles.isEmpty()) persistAll()
     }
 
     fun persistAll() {
@@ -192,7 +196,9 @@ class ChatController(
                 ),
 
                 userProfiles = userProfiles,
-                selectedProfileId = selectedProfileId
+                selectedProfileId = selectedProfileId,
+
+                taskFsm = taskFsm
             )
         )
     }
@@ -261,10 +267,31 @@ class ChatController(
         error = null
         messagesUi += "user" to userText
 
-        // Явное разнесение: роутим working/long-term отдельно от short-term
+        // 1) локальные команды pause/resume (без модели)
+        val pauseAction = detectPauseResume(userText)
+        if (pauseAction != null) {
+            taskFsm = taskFsm.copy(isPaused = pauseAction)
+            persistAll()
+            // если поставили паузу — не нужно объяснять заново: просто скажем "на паузе"
+            if (pauseAction) {
+                requestJob?.cancel()
+                requestJob = null
+                isWaitingResponse = false
+
+                messagesUi += "assistant" to "Ок, поставил задачу на паузу. Чтобы продолжить — напиши “resume/продолжай”."
+                return
+            } else {
+                messagesUi += "assistant" to "Продолжаю с текущего состояния без повторных объяснений."
+                // продолжаем обычную отправку ниже
+            }
+        }
+
+        // 2) обновляем FSM и память после user
+        routeTaskStateAfterUser(userText)
         routeMemoryAfterUser(userText)
 
-        scope.launch {
+        requestJob?.cancel()
+        requestJob = scope.launch {
             when (strategy) {
                 ContextStrategyType.LEGACY_SUMMARY_WINDOW -> sendLegacy(userText)
                 ContextStrategyType.SLIDING_WINDOW -> sendSliding(userText)
@@ -274,7 +301,87 @@ class ChatController(
         }
     }
 
-    // ===== Memory Router: working + long-term (явно отдельно) =====
+    // ===== Task FSM routing =====
+    private fun routeTaskStateAfterUser(userText: String) {
+        if (taskStateJob?.isActive == true) return
+
+        val before = taskFsm
+        val ws = workingSummary
+        val lastAssistant = messagesUi.lastOrNull { it.first == "assistant" }?.second
+
+        taskStateJob = scope.launch {
+            try {
+                // если на паузе и пользователь не resume — не меняем FSM через модель
+                if (before.isPaused && detectPauseResume(userText) != false) return@launch
+
+                val (upd, usage) = TaskStateRouter.route(
+                    client = client,
+                    userMessage = userText,
+                    assistantMessage = lastAssistant,
+                    current = before,
+                    workingSummary = ws
+                )
+
+                if (upd != null) {
+                    val next = applyTaskUpdate(before, upd, userText)
+                    if (next != before) {
+                        taskFsm = next
+                        persistAll()
+                        println("TASK_FSM updated phase=${next.phase} paused=${next.isPaused}")
+                    }
+                }
+
+                sessionDialogueTokensTotal += (usage?.totalTokens ?: 0).toLong()
+                persistAll()
+            } catch (t: Throwable) {
+                println("TASK_FSM router error: ${t.message ?: t}")
+            }
+        }
+    }
+
+    private fun applyTaskUpdate(current: TaskFsmState, upd: TaskStateUpdate, userText: String): TaskFsmState {
+        val resume = detectPauseResume(userText) == false
+        val pause = detectPauseResume(userText) == true
+
+        val isPaused = when {
+            pause -> true
+            resume -> false
+            upd.isPaused != null -> upd.isPaused
+            else -> current.isPaused
+        }
+
+        // если paused=true — запрещаем продвижение phase/step (кроме resume)
+        if (isPaused && !resume) {
+            return current.copy(
+                isPaused = true,
+                expectedAction = upd.expectedAction?.trim().orEmpty().ifBlank { current.expectedAction }
+            )
+        }
+
+        val phase = parseTaskPhase(upd.phase) ?: current.phase
+        val step = upd.currentStep?.trim().orEmpty().ifBlank { current.currentStep }
+        val exp = upd.expectedAction?.trim().orEmpty().ifBlank { current.expectedAction }
+
+        return current.copy(
+            phase = phase,
+            currentStep = step,
+            expectedAction = exp,
+            isPaused = isPaused
+        )
+    }
+
+    private fun detectPauseResume(text: String): Boolean? {
+        val t = text.trim().lowercase()
+        val pause = listOf("pause", "пауза", "стоп", "останови", "заморозь")
+        val resume = listOf("resume", "continue", "продолжай", "продолжить", "поехали", "давай дальше")
+        return when {
+            pause.any { t == it || t.startsWith("$it ") } -> true
+            resume.any { t == it || t.startsWith("$it ") } -> false
+            else -> null
+        }
+    }
+
+    // ===== Memory Router (как у тебя) =====
     private fun routeMemoryAfterUser(userText: String) {
         if (memoryJob?.isActive == true) return
 
@@ -297,7 +404,6 @@ class ChatController(
                 lastMemoryRouterApplied = result
 
                 if (result != null) {
-                    // apply deltas explicitly
                     val workingAfter = applyDelta(workingBefore, result.workingFactsDelta)
                     val longAfter = applyDelta(longBefore, result.longTermDelta)
                     val notesAfter = mergeNotes(notesBefore, result.longTermNotesDelta, limit = 30)
@@ -308,29 +414,15 @@ class ChatController(
                         wsBefore
                     }
 
-                    // assign
                     workingFacts = workingAfter
                     longTermProfile = longAfter
                     longTermNotes = notesAfter
                     workingSummary = wsAfter
 
-                    // ===== AUDIT LOGS =====
                     println("MEMORY_ROUTER raw=${raw.shrinkForLog(800)}")
-                    println(
-                        "MEMORY_APPLY working: upsert=${result.workingFactsDelta.upsert.keys.sorted()} " +
-                                "remove=${result.workingFactsDelta.remove.sorted()}"
-                    )
-                    println(
-                        "MEMORY_APPLY longTerm: upsert=${result.longTermDelta.upsert.keys.sorted()} " +
-                                "remove=${result.longTermDelta.remove.sorted()}"
-                    )
-                    println(
-                        "MEMORY_APPLY workingSummaryChanged=${!result.workingSummaryDelta.isNullOrBlank()} " +
-                                "longTermNotesAdded=${result.longTermNotesDelta.size}"
-                    )
-                    println("MEMORY_SNAPSHOT workingFactsKeys=${workingAfter.keys.sorted()}")
-                    println("MEMORY_SNAPSHOT longTermKeys=${longAfter.keys.sorted()}")
-                    println("MEMORY_SNAPSHOT longTermNotesCount=${notesAfter.size}")
+                    println("MEMORY_APPLY working: upsert=${result.workingFactsDelta.upsert.keys.sorted()} remove=${result.workingFactsDelta.remove.sorted()}")
+                    println("MEMORY_APPLY longTerm: upsert=${result.longTermDelta.upsert.keys.sorted()} remove=${result.longTermDelta.remove.sorted()}")
+                    println("MEMORY_APPLY workingSummaryChanged=${!result.workingSummaryDelta.isNullOrBlank()} longTermNotesAdded=${result.longTermNotesDelta.size}")
                 } else {
                     println("MEMORY_ROUTER parseFailed raw=${raw.shrinkForLog(800)}")
                 }
@@ -341,6 +433,25 @@ class ChatController(
                 isUpdatingFacts = false
             }
         }
+    }
+
+    fun pauseTask() {
+        if (taskFsm.isPaused) return
+
+        requestJob?.cancel()
+        requestJob = null
+        isWaitingResponse = false
+
+        taskFsm = taskFsm.copy(isPaused = true)
+        persistAll()
+        messagesUi += "assistant" to "Ок, поставил задачу на паузу. Чтобы продолжить — нажми Resume или напиши “resume/продолжай”."
+    }
+
+    fun resumeTask() {
+        if (!taskFsm.isPaused) return
+        taskFsm = taskFsm.copy(isPaused = false)
+        persistAll()
+        messagesUi += "assistant" to "Продолжаю с текущего состояния без повторных объяснений."
     }
 
     private suspend fun routeMemoryInternal(
@@ -404,7 +515,7 @@ class ChatController(
         return runCatching { routerJson.decodeFromString(MemoryRouterResult.serializer(), candidate) }.getOrNull()
     }
 
-    // ===== Strategy 0: Legacy summary + window (сохраняем прежнюю логику) =====
+    // ===== Strategy 0: Legacy summary + window =====
     private suspend fun sendLegacy(userText: String) {
         if (legacyWindow.size >= HISTORY_WINDOW_MESSAGES && (summarizeJob?.isActive != true)) {
             val chunk = legacyWindow.toList()
@@ -425,7 +536,6 @@ class ChatController(
                         summarizeChunkWithUsage(client, currentNow, chunk).text
                     }
 
-                    // legacy summary логически = рабочий summary текущей задачи
                     workingSummary = legacySummary
 
                     sessionDialogueTokensTotal += (sumRes.usage?.totalTokens ?: 0).toLong()
@@ -451,6 +561,7 @@ class ChatController(
             val result = client.chat(
                 messages = buildLegacyRequestMessages(
                     profile = profile,
+                    taskFsm = taskFsm,
                     legacySummary = legacySummary,
                     workingFacts = workingFacts,
                     workingSummary = workingSummary,
@@ -468,6 +579,8 @@ class ChatController(
             legacyWindow += ChatMessage("assistant", result.text)
             trimToWindow(legacyWindow)
             persistAll()
+        } catch (t: CancellationException) {
+            throw t // важно пробросить, чтобы корректно завершить coroutine
         } catch (t: Throwable) {
             error = t.message ?: t.toString()
         } finally {
@@ -475,7 +588,6 @@ class ChatController(
         }
     }
 
-    // ===== Strategy 1: Sliding window =====
     private suspend fun sendSliding(userText: String) {
         slidingHistory = (slidingHistory + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
         persistAll()
@@ -489,6 +601,7 @@ class ChatController(
             val result = client.chat(
                 messages = buildSlidingRequestMessages(
                     profile = profile,
+                    taskFsm = taskFsm,
                     workingFacts = workingFacts,
                     workingSummary = workingSummary,
                     longTermProfile = longTermProfile,
@@ -511,7 +624,6 @@ class ChatController(
         }
     }
 
-    // ===== Strategy 2: Sticky facts =====
     private suspend fun sendStickyFacts(userText: String) {
         factsHistory = (factsHistory + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
         persistAll()
@@ -525,6 +637,7 @@ class ChatController(
             val result = client.chat(
                 messages = buildStickyFactsRequestMessages(
                     profile = profile,
+                    taskFsm = taskFsm,
                     workingFacts = workingFacts,
                     workingSummary = workingSummary,
                     longTermProfile = longTermProfile,
@@ -547,7 +660,6 @@ class ChatController(
         }
     }
 
-    // ===== Strategy 3: Branching =====
     private suspend fun sendBranching(userText: String) {
         val branch = getCurrentBranch()
         val newHist = (branch.history + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
@@ -563,6 +675,7 @@ class ChatController(
             val result = client.chat(
                 messages = buildBranchingRequestMessages(
                     profile = profile,
+                    taskFsm = taskFsm,
                     branchId = currentBranchId,
                     workingFacts = workingFacts,
                     workingSummary = workingSummary,
@@ -610,6 +723,10 @@ class ChatController(
     fun factsCountForFooter(): Int = workingFacts.size
     fun branchesCountForFooter(): Int = branches.size
 
+    // FSM footer helpers
+    fun taskPhaseForFooter(): String = taskFsm.phase.asWire()
+    fun taskPausedForFooter(): Boolean = taskFsm.isPaused
+
     private fun logRequestSnapshot(tag: String, shortTermCount: Int) {
         println(
             "MEMORY_REQUEST [$tag] shortTermCount=$shortTermCount " +
@@ -617,17 +734,33 @@ class ChatController(
                     "longTermKeys=${longTermProfile.keys.sorted()} " +
                     "longTermNotesCount=${longTermNotes.size} " +
                     "workingSummaryLen=${workingSummary.length} " +
-                    "profileId=$selectedProfileId"
+                    "profileId=$selectedProfileId " +
+                    "taskPhase=${taskFsm.phase.asWire()} paused=${taskFsm.isPaused}"
         )
     }
 }
+
+private fun nowMillis(): Long = Clock.System.now().toEpochMilliseconds()
 
 /* ===========================
    Формирование запросов
    =========================== */
 
+private fun buildTaskFsmBlock(taskFsm: TaskFsmState): String = buildString {
+    append("Состояние задачи (FSM):\n")
+    append("- phase: ").append(taskFsm.phase.asWire()).append("\n")
+    append("- current_step: ").append(taskFsm.currentStep.ifBlank { "(empty)" }).append("\n")
+    append("- expected_action: ").append(taskFsm.expectedAction.ifBlank { "(empty)" }).append("\n")
+    append("- is_paused: ").append(taskFsm.isPaused).append("\n\n")
+
+    append("Правила FSM:\n")
+    append("- Если is_paused=true: НЕ продвигай задачу, не повторяй объяснения. Кратко напомни expected_action и попроси resume.\n")
+    append("- Если resume: продолжай с текущего состояния без повторных объяснений.\n")
+}.trim()
+
 private fun buildMemorySystemBlock(
     profile: UserProfile?,
+    taskFsm: TaskFsmState,
     workingFacts: Map<String, String>,
     workingSummary: String,
     longTermProfile: Map<String, String>,
@@ -646,6 +779,8 @@ private fun buildMemorySystemBlock(
             append(profile.systemPrompt.trim()).append("\n")
         }
     }
+
+    append("\n").append(buildTaskFsmBlock(taskFsm)).append("\n")
 
     if (longTermProfile.isNotEmpty() || longTermNotes.isNotEmpty()) {
         append("\nДолговременная память (profile):\n")
@@ -674,6 +809,7 @@ private fun buildMemorySystemBlock(
 
 private fun buildLegacyRequestMessages(
     profile: UserProfile?,
+    taskFsm: TaskFsmState,
     legacySummary: String,
     workingFacts: Map<String, String>,
     workingSummary: String,
@@ -685,7 +821,7 @@ private fun buildLegacyRequestMessages(
         ChatMessage(
             role = "system",
             content = buildString {
-                append(buildMemorySystemBlock(profile, workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append(buildMemorySystemBlock(profile, taskFsm, workingFacts, workingSummary, longTermProfile, longTermNotes))
                 if (legacySummary.isNotBlank()) {
                     append("\n\nКонтекст (legacy summary):\n")
                     append(legacySummary)
@@ -698,18 +834,20 @@ private fun buildLegacyRequestMessages(
 
 private fun buildSlidingRequestMessages(
     profile: UserProfile?,
+    taskFsm: TaskFsmState,
     workingFacts: Map<String, String>,
     workingSummary: String,
     longTermProfile: Map<String, String>,
     longTermNotes: List<String>,
     historyWindow: List<ChatMessage>
 ): List<ChatMessage> = buildList {
-    add(ChatMessage("system", buildMemorySystemBlock(profile, workingFacts, workingSummary, longTermProfile, longTermNotes)))
+    add(ChatMessage("system", buildMemorySystemBlock(profile, taskFsm, workingFacts, workingSummary, longTermProfile, longTermNotes)))
     addAll(historyWindow)
 }
 
 private fun buildStickyFactsRequestMessages(
     profile: UserProfile?,
+    taskFsm: TaskFsmState,
     workingFacts: Map<String, String>,
     workingSummary: String,
     longTermProfile: Map<String, String>,
@@ -720,7 +858,7 @@ private fun buildStickyFactsRequestMessages(
         ChatMessage(
             "system",
             buildString {
-                append(buildMemorySystemBlock(profile, workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append(buildMemorySystemBlock(profile, taskFsm, workingFacts, workingSummary, longTermProfile, longTermNotes))
                 append("\n\nПравило: используй рабочие facts/память как источник истины; история — только для локального контекста.\n")
             }.trim()
         )
@@ -730,6 +868,7 @@ private fun buildStickyFactsRequestMessages(
 
 private fun buildBranchingRequestMessages(
     profile: UserProfile?,
+    taskFsm: TaskFsmState,
     branchId: String,
     workingFacts: Map<String, String>,
     workingSummary: String,
@@ -741,7 +880,7 @@ private fun buildBranchingRequestMessages(
         ChatMessage(
             "system",
             buildString {
-                append(buildMemorySystemBlock(profile, workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append(buildMemorySystemBlock(profile, taskFsm, workingFacts, workingSummary, longTermProfile, longTermNotes))
                 append("\n\nВетка диалога: ").append(branchId).append("\n")
             }.trim()
         )

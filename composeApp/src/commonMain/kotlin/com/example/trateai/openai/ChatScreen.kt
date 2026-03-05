@@ -26,6 +26,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -92,7 +93,6 @@ fun ChatScreen(
 
         Divider()
 
-        // ✅ Fix: keep footer + input above system nav bar and IME
         Column(
             Modifier
                 .fillMaxWidth()
@@ -107,7 +107,11 @@ fun ChatScreen(
                 historyWindow = 6,
                 strategy = controller.strategy,
                 factsCount = controller.factsCountForFooter(),
-                branchesCount = controller.branchesCountForFooter()
+                branchesCount = controller.branchesCountForFooter(),
+                taskPhase = controller.taskPhaseForFooter(),
+                taskPaused = controller.taskPausedForFooter(),
+                onPause = { controller.pauseTask() },
+                onResume = { controller.resumeTask() }
             )
 
             Row(
@@ -148,7 +152,11 @@ private fun FooterStatsCard(
     historyWindow: Int,
     strategy: ContextStrategyType,
     factsCount: Int,
-    branchesCount: Int
+    branchesCount: Int,
+    taskPhase: String,
+    taskPaused: Boolean,
+    onPause: () -> Unit,
+    onResume: () -> Unit
 ) {
     ElevatedCard(
         modifier = Modifier
@@ -161,6 +169,7 @@ private fun FooterStatsCard(
                 AssistChip(onClick = {}, label = { Text("Last • in $lastIn / out $lastOut") })
                 AssistChip(onClick = {}, label = { Text("Session $sessionTotal") })
             }
+
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 AssistChip(onClick = {}, label = { Text("${strategy.title} • History $historySize/$historyWindow") })
                 when (strategy) {
@@ -168,6 +177,28 @@ private fun FooterStatsCard(
                     ContextStrategyType.BRANCHING -> AssistChip(onClick = {}, label = { Text("Branches $branchesCount") })
                     else -> Unit
                 }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                AssistChip(onClick = {}, label = { Text("Task • $taskPhase") })
+                if (taskPaused) {
+                    AssistChip(onClick = {}, label = { Text("Paused") })
+                }
+                Spacer(Modifier.weight(1f))
+
+                OutlinedButton(
+                    enabled = !taskPaused,
+                    onClick = onPause
+                ) { Text("Pause") }
+
+                Button(
+                    enabled = taskPaused,
+                    onClick = onResume
+                ) { Text("Resume") }
             }
         }
     }
