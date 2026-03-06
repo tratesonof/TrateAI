@@ -7,11 +7,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
-import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Clock
 import kotlin.time.TimeSource
 
@@ -116,6 +118,32 @@ class ChatController(
         return map.values.sortedWith(compareBy<UserProfile> { !it.isBuiltIn }.thenBy { it.title })
     }
 
+    // ===== Invariants =====
+    var invariants by mutableStateOf(initial.invariants)
+
+    fun upsertInvariant(oldKey: String? = null, newKey: String, value: String) {
+        val normalizedKey = normalizeInvariantKey(newKey)
+        val normalizedValue = value.trim()
+        if (normalizedKey.isBlank() || normalizedValue.isBlank()) return
+
+        invariants = invariants.toMutableMap().apply {
+            if (!oldKey.isNullOrBlank() && oldKey != normalizedKey) {
+                remove(oldKey)
+            }
+            put(normalizedKey, normalizedValue)
+        }.toSortedMap()
+
+        persistAll()
+        println("INVARIANT_UI upsert key=$normalizedKey")
+    }
+
+    fun removeInvariant(key: String) {
+        if (!invariants.containsKey(key)) return
+        invariants = invariants.toMutableMap().apply { remove(key) }.toSortedMap()
+        persistAll()
+        println("INVARIANT_UI remove key=$key")
+    }
+
     // ===== Task FSM =====
     var taskFsm by mutableStateOf(initial.taskFsm)
     private var taskStateJob: Job? by mutableStateOf(null)
@@ -156,7 +184,6 @@ class ChatController(
 
     private var summarizeJob: Job? by mutableStateOf(null)
     private var memoryJob: Job? by mutableStateOf(null)
-
     private var requestJob: Job? by mutableStateOf(null)
 
     private val routerJson = Json {
@@ -197,6 +224,8 @@ class ChatController(
 
                 userProfiles = userProfiles,
                 selectedProfileId = selectedProfileId,
+
+                invariants = invariants,
 
                 taskFsm = taskFsm
             )
@@ -267,12 +296,10 @@ class ChatController(
         error = null
         messagesUi += "user" to userText
 
-        // 1) локальные команды pause/resume (без модели)
         val pauseAction = detectPauseResume(userText)
         if (pauseAction != null) {
             taskFsm = taskFsm.copy(isPaused = pauseAction)
             persistAll()
-            // если поставили паузу — не нужно объяснять заново: просто скажем "на паузе"
             if (pauseAction) {
                 requestJob?.cancel()
                 requestJob = null
@@ -282,11 +309,9 @@ class ChatController(
                 return
             } else {
                 messagesUi += "assistant" to "Продолжаю с текущего состояния без повторных объяснений."
-                // продолжаем обычную отправку ниже
             }
         }
 
-        // 2) обновляем FSM и память после user
         routeTaskStateAfterUser(userText)
         routeMemoryAfterUser(userText)
 
@@ -301,7 +326,6 @@ class ChatController(
         }
     }
 
-    // ===== Task FSM routing =====
     private fun routeTaskStateAfterUser(userText: String) {
         if (taskStateJob?.isActive == true) return
 
@@ -311,7 +335,6 @@ class ChatController(
 
         taskStateJob = scope.launch {
             try {
-                // если на паузе и пользователь не resume — не меняем FSM через модель
                 if (before.isPaused && detectPauseResume(userText) != false) return@launch
 
                 val (upd, usage) = TaskStateRouter.route(
@@ -350,7 +373,6 @@ class ChatController(
             else -> current.isPaused
         }
 
-        // если paused=true — запрещаем продвижение phase/step (кроме resume)
         if (isPaused && !resume) {
             return current.copy(
                 isPaused = true,
@@ -381,7 +403,6 @@ class ChatController(
         }
     }
 
-    // ===== Memory Router (как у тебя) =====
     private fun routeMemoryAfterUser(userText: String) {
         if (memoryJob?.isActive == true) return
 
@@ -515,7 +536,6 @@ class ChatController(
         return runCatching { routerJson.decodeFromString(MemoryRouterResult.serializer(), candidate) }.getOrNull()
     }
 
-    // ===== Strategy 0: Legacy summary + window =====
     private suspend fun sendLegacy(userText: String) {
         if (legacyWindow.size >= HISTORY_WINDOW_MESSAGES && (summarizeJob?.isActive != true)) {
             val chunk = legacyWindow.toList()
@@ -562,6 +582,7 @@ class ChatController(
                 messages = buildLegacyRequestMessages(
                     profile = profile,
                     taskFsm = taskFsm,
+                    invariants = invariants,
                     legacySummary = legacySummary,
                     workingFacts = workingFacts,
                     workingSummary = workingSummary,
@@ -573,14 +594,21 @@ class ChatController(
                 model = selectedModel.id
             )
 
-            applyUsageAndLog(result, started)
-            messagesUi += "assistant" to result.text
+            val guarded = applyInvariantGuard(result.text)
 
-            legacyWindow += ChatMessage("assistant", result.text)
+            applyUsageAndLog(
+                result = result,
+                started = started,
+                extraUsage = guarded.usage
+            )
+
+            messagesUi += "assistant" to guarded.text
+
+            legacyWindow += ChatMessage("assistant", guarded.text)
             trimToWindow(legacyWindow)
             persistAll()
         } catch (t: CancellationException) {
-            throw t // важно пробросить, чтобы корректно завершить coroutine
+            throw t
         } catch (t: Throwable) {
             error = t.message ?: t.toString()
         } finally {
@@ -602,6 +630,7 @@ class ChatController(
                 messages = buildSlidingRequestMessages(
                     profile = profile,
                     taskFsm = taskFsm,
+                    invariants = invariants,
                     workingFacts = workingFacts,
                     workingSummary = workingSummary,
                     longTermProfile = longTermProfile,
@@ -612,10 +641,17 @@ class ChatController(
                 model = selectedModel.id
             )
 
-            applyUsageAndLog(result, started)
-            messagesUi += "assistant" to result.text
+            val guarded = applyInvariantGuard(result.text)
 
-            slidingHistory = (slidingHistory + ChatMessage("assistant", result.text)).takeLast(HISTORY_WINDOW_MESSAGES)
+            applyUsageAndLog(
+                result = result,
+                started = started,
+                extraUsage = guarded.usage
+            )
+
+            messagesUi += "assistant" to guarded.text
+
+            slidingHistory = (slidingHistory + ChatMessage("assistant", guarded.text)).takeLast(HISTORY_WINDOW_MESSAGES)
             persistAll()
         } catch (t: Throwable) {
             error = t.message ?: t.toString()
@@ -638,6 +674,7 @@ class ChatController(
                 messages = buildStickyFactsRequestMessages(
                     profile = profile,
                     taskFsm = taskFsm,
+                    invariants = invariants,
                     workingFacts = workingFacts,
                     workingSummary = workingSummary,
                     longTermProfile = longTermProfile,
@@ -648,10 +685,17 @@ class ChatController(
                 model = selectedModel.id
             )
 
-            applyUsageAndLog(result, started)
-            messagesUi += "assistant" to result.text
+            val guarded = applyInvariantGuard(result.text)
 
-            factsHistory = (factsHistory + ChatMessage("assistant", result.text)).takeLast(HISTORY_WINDOW_MESSAGES)
+            applyUsageAndLog(
+                result = result,
+                started = started,
+                extraUsage = guarded.usage
+            )
+
+            messagesUi += "assistant" to guarded.text
+
+            factsHistory = (factsHistory + ChatMessage("assistant", guarded.text)).takeLast(HISTORY_WINDOW_MESSAGES)
             persistAll()
         } catch (t: Throwable) {
             error = t.message ?: t.toString()
@@ -676,6 +720,7 @@ class ChatController(
                 messages = buildBranchingRequestMessages(
                     profile = profile,
                     taskFsm = taskFsm,
+                    invariants = invariants,
                     branchId = currentBranchId,
                     workingFacts = workingFacts,
                     workingSummary = workingSummary,
@@ -687,10 +732,17 @@ class ChatController(
                 model = selectedModel.id
             )
 
-            applyUsageAndLog(result, started)
-            messagesUi += "assistant" to result.text
+            val guarded = applyInvariantGuard(result.text)
 
-            val after = (newHist + ChatMessage("assistant", result.text)).takeLast(HISTORY_WINDOW_MESSAGES)
+            applyUsageAndLog(
+                result = result,
+                started = started,
+                extraUsage = guarded.usage
+            )
+
+            messagesUi += "assistant" to guarded.text
+
+            val after = (newHist + ChatMessage("assistant", guarded.text)).takeLast(HISTORY_WINDOW_MESSAGES)
             setCurrentBranchState(getCurrentBranch().copy(history = after))
             persistAll()
         } catch (t: Throwable) {
@@ -700,16 +752,105 @@ class ChatController(
         }
     }
 
-    private fun applyUsageAndLog(result: ChatResult, started: TimeSource.Monotonic.ValueTimeMark) {
+    private suspend fun applyInvariantGuard(answer: String): GuardedAnswer {
+        if (invariants.isEmpty()) return GuardedAnswer(text = answer, usage = null)
+
+        val model = "gpt-5-mini"
+        val prompt = buildString {
+            append("Ты проверяешь ответ ассистента на нарушение инвариантов.\n")
+            append("Инварианты обязательны и не могут быть нарушены.\n")
+            append("Если ответ нарушает хотя бы один инвариант, нужно это явно отметить и дать безопасную альтернативу.\n\n")
+
+            append("Верни строго JSON без текста вокруг:\n")
+            append("{\n")
+            append("  \"violates\": true|false,\n")
+            append("  \"reason\": \"короткое объяснение\",\n")
+            append("  \"violated_invariants\": [\"key1\", \"key2\"],\n")
+            append("  \"safe_alternative\": \"безопасная альтернатива, соблюдающая инварианты\" | null\n")
+            append("}\n\n")
+
+            append("Инварианты:\n")
+            if (invariants.isEmpty()) {
+                append("(empty)\n")
+            } else {
+                invariants.entries.sortedBy { it.key }.forEach { (k, v) ->
+                    append("- ").append(k).append(": ").append(v).append("\n")
+                }
+            }
+
+            append("\nОтвет ассистента:\n")
+            append(answer)
+        }
+
+        val res = client.chat(
+            messages = listOf(
+                ChatMessage("system", "Ты — Invariant Guard. Отвечай строго JSON."),
+                ChatMessage("user", prompt)
+            ),
+            temperature = null,
+            model = model
+        )
+
+        val decision = parseInvariantGuardJson(res.text)
+        if (decision == null || !decision.violates) {
+            return GuardedAnswer(text = answer, usage = res.usage)
+        }
+
+        val violationKeys = decision.violatedInvariants
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+
+        val refusal = buildString {
+            append("Не могу предложить решение в таком виде, потому что оно нарушает инварианты")
+            if (violationKeys.isNotEmpty()) {
+                append(": ")
+                append(violationKeys.joinToString(", "))
+            }
+            append(".\n")
+
+            if (decision.reason.isNotBlank()) {
+                append("\n")
+                append(decision.reason.trim())
+                append("\n")
+            }
+
+            if (!decision.safeAlternative.isNullOrBlank()) {
+                append("\nАльтернатива, которая соблюдает ограничения:\n")
+                append(decision.safeAlternative.trim())
+            }
+        }.trim()
+
+        return GuardedAnswer(text = refusal, usage = res.usage)
+    }
+
+    private fun parseInvariantGuardJson(raw: String): InvariantGuardDecision? {
+        val t = raw.trim()
+        val start = t.indexOf('{')
+        val end = t.lastIndexOf('}')
+        if (start < 0 || end <= start) return null
+        val candidate = t.substring(start, end + 1)
+        return runCatching { routerJson.decodeFromString(InvariantGuardDecision.serializer(), candidate) }.getOrNull()
+    }
+
+    private fun applyUsageAndLog(
+        result: ChatResult,
+        started: TimeSource.Monotonic.ValueTimeMark,
+        extraUsage: ResponseUsage? = null
+    ) {
         lastRequestInputTokens = (result.usage?.inputTokens ?: 0).toLong()
         lastResponseOutputTokens = (result.usage?.outputTokens ?: 0).toLong()
-        sessionDialogueTokensTotal += (result.usage?.totalTokens ?: 0).toLong()
+
+        val requestTokens = (result.usage?.totalTokens ?: 0).toLong()
+        val guardTokens = (extraUsage?.totalTokens ?: 0).toLong()
+        sessionDialogueTokensTotal += requestTokens + guardTokens
 
         val latencyMs = started.elapsedNow().inWholeMilliseconds
         println(
             "OPENAI model=${selectedModel.id} latencyMs=$latencyMs " +
                     "lastIn=$lastRequestInputTokens lastOut=$lastResponseOutputTokens " +
-                    "sessionTokensTotal=$sessionDialogueTokensTotal"
+                    "sessionTokensTotal=$sessionDialogueTokensTotal " +
+                    "guardTokens=$guardTokens"
         )
     }
 
@@ -722,8 +863,6 @@ class ChatController(
 
     fun factsCountForFooter(): Int = workingFacts.size
     fun branchesCountForFooter(): Int = branches.size
-
-    // FSM footer helpers
     fun taskPhaseForFooter(): String = taskFsm.phase.asWire()
     fun taskPausedForFooter(): Boolean = taskFsm.isPaused
 
@@ -732,6 +871,7 @@ class ChatController(
             "MEMORY_REQUEST [$tag] shortTermCount=$shortTermCount " +
                     "workingFactsKeys=${workingFacts.keys.sorted()} " +
                     "longTermKeys=${longTermProfile.keys.sorted()} " +
+                    "invariantKeys=${invariants.keys.sorted()} " +
                     "longTermNotesCount=${longTermNotes.size} " +
                     "workingSummaryLen=${workingSummary.length} " +
                     "profileId=$selectedProfileId " +
@@ -740,7 +880,28 @@ class ChatController(
     }
 }
 
+@Serializable
+private data class InvariantGuardDecision(
+    @SerialName("violates") val violates: Boolean = false,
+    @SerialName("reason") val reason: String = "",
+    @SerialName("violated_invariants") val violatedInvariants: List<String> = emptyList(),
+    @SerialName("safe_alternative") val safeAlternative: String? = null
+)
+
+private data class GuardedAnswer(
+    val text: String,
+    val usage: ResponseUsage?
+)
+
 private fun nowMillis(): Long = Clock.System.now().toEpochMilliseconds()
+
+private fun normalizeInvariantKey(raw: String): String {
+    return raw.trim()
+        .lowercase()
+        .replace(Regex("[^a-z0-9а-я_\\-\\s]"), "")
+        .replace(Regex("[\\s\\-]+"), "_")
+        .trim('_')
+}
 
 /* ===========================
    Формирование запросов
@@ -761,6 +922,7 @@ private fun buildTaskFsmBlock(taskFsm: TaskFsmState): String = buildString {
 private fun buildMemorySystemBlock(
     profile: UserProfile?,
     taskFsm: TaskFsmState,
+    invariants: Map<String, String>,
     workingFacts: Map<String, String>,
     workingSummary: String,
     longTermProfile: Map<String, String>,
@@ -778,6 +940,19 @@ private fun buildMemorySystemBlock(
             append("\nСистемные инструкции профиля:\n")
             append(profile.systemPrompt.trim()).append("\n")
         }
+    }
+
+    if (invariants.isNotEmpty()) {
+        append("\nИнварианты системы (обязательные ограничения):\n")
+        invariants.entries.sortedBy { it.key }.forEach { (k, v) ->
+            append("- ").append(k).append(": ").append(v).append("\n")
+        }
+
+        append("\nПравила для инвариантов:\n")
+        append("- Всегда сначала сверяй решение с этими инвариантами.\n")
+        append("- Не предлагай варианты, которые им противоречат.\n")
+        append("- Если запрос пользователя конфликтует с инвариантами — прямо откажись от нарушающего варианта.\n")
+        append("- После отказа предложи ближайшую допустимую альтернативу.\n")
     }
 
     append("\n").append(buildTaskFsmBlock(taskFsm)).append("\n")
@@ -810,6 +985,7 @@ private fun buildMemorySystemBlock(
 private fun buildLegacyRequestMessages(
     profile: UserProfile?,
     taskFsm: TaskFsmState,
+    invariants: Map<String, String>,
     legacySummary: String,
     workingFacts: Map<String, String>,
     workingSummary: String,
@@ -821,7 +997,7 @@ private fun buildLegacyRequestMessages(
         ChatMessage(
             role = "system",
             content = buildString {
-                append(buildMemorySystemBlock(profile, taskFsm, workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append(buildMemorySystemBlock(profile, taskFsm, invariants, workingFacts, workingSummary, longTermProfile, longTermNotes))
                 if (legacySummary.isNotBlank()) {
                     append("\n\nКонтекст (legacy summary):\n")
                     append(legacySummary)
@@ -835,19 +1011,21 @@ private fun buildLegacyRequestMessages(
 private fun buildSlidingRequestMessages(
     profile: UserProfile?,
     taskFsm: TaskFsmState,
+    invariants: Map<String, String>,
     workingFacts: Map<String, String>,
     workingSummary: String,
     longTermProfile: Map<String, String>,
     longTermNotes: List<String>,
     historyWindow: List<ChatMessage>
 ): List<ChatMessage> = buildList {
-    add(ChatMessage("system", buildMemorySystemBlock(profile, taskFsm, workingFacts, workingSummary, longTermProfile, longTermNotes)))
+    add(ChatMessage("system", buildMemorySystemBlock(profile, taskFsm, invariants, workingFacts, workingSummary, longTermProfile, longTermNotes)))
     addAll(historyWindow)
 }
 
 private fun buildStickyFactsRequestMessages(
     profile: UserProfile?,
     taskFsm: TaskFsmState,
+    invariants: Map<String, String>,
     workingFacts: Map<String, String>,
     workingSummary: String,
     longTermProfile: Map<String, String>,
@@ -858,7 +1036,7 @@ private fun buildStickyFactsRequestMessages(
         ChatMessage(
             "system",
             buildString {
-                append(buildMemorySystemBlock(profile, taskFsm, workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append(buildMemorySystemBlock(profile, taskFsm, invariants, workingFacts, workingSummary, longTermProfile, longTermNotes))
                 append("\n\nПравило: используй рабочие facts/память как источник истины; история — только для локального контекста.\n")
             }.trim()
         )
@@ -869,6 +1047,7 @@ private fun buildStickyFactsRequestMessages(
 private fun buildBranchingRequestMessages(
     profile: UserProfile?,
     taskFsm: TaskFsmState,
+    invariants: Map<String, String>,
     branchId: String,
     workingFacts: Map<String, String>,
     workingSummary: String,
@@ -880,7 +1059,7 @@ private fun buildBranchingRequestMessages(
         ChatMessage(
             "system",
             buildString {
-                append(buildMemorySystemBlock(profile, taskFsm, workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append(buildMemorySystemBlock(profile, taskFsm, invariants, workingFacts, workingSummary, longTermProfile, longTermNotes))
                 append("\n\nВетка диалога: ").append(branchId).append("\n")
             }.trim()
         )

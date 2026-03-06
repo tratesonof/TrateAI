@@ -32,6 +32,9 @@ data class ChatState(
     val userProfiles: List<UserProfile> = emptyList(),
     val selectedProfileId: String = DEFAULT_PROFILE_FUN,
 
+    // ===== Invariants =====
+    val invariants: Map<String, String> = emptyMap(),
+
     // ===== Task FSM =====
     val taskFsm: TaskFsmState = TaskFsmState()
 )

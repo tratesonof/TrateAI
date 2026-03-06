@@ -14,6 +14,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilterChip
@@ -27,11 +28,10 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
@@ -76,7 +76,6 @@ fun SettingsScreen(
                 }
             }
 
-            // ===== Profiles =====
             item {
                 ElevatedCard(shape = RoundedCornerShape(16.dp)) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -94,7 +93,9 @@ fun SettingsScreen(
                             onExpandedChange = { expanded = !expanded }
                         ) {
                             OutlinedTextField(
-                                modifier = Modifier.menuAnchor().fillMaxWidth(),
+                                modifier = Modifier
+                                    .menuAnchor()
+                                    .fillMaxWidth(),
                                 value = selected?.title.orEmpty(),
                                 onValueChange = {},
                                 readOnly = true,
@@ -161,13 +162,125 @@ fun SettingsScreen(
                                 onDismiss = { showEdit = false },
                                 onConfirm = { draft ->
                                     if (selected.isBuiltIn) {
-                                        // built-in нельзя редактировать напрямую -> создаём кастомную копию
                                         controller.createProfile(draft.copy(id = "tmp", isBuiltIn = false))
                                     } else {
                                         controller.upsertProfile(draft.copy(id = selected.id, isBuiltIn = false))
                                         controller.setSelectedProfile(selected.id)
                                     }
                                     showEdit = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
+            item {
+                ElevatedCard(shape = RoundedCornerShape(16.dp)) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("Invariants", style = MaterialTheme.typography.titleMedium)
+
+                        Text(
+                            text = "Отдельный слой ограничений, который всегда прокидывается в model prompt. Ассистент не должен предлагать решения, которые их нарушают.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        var showCreate by remember { mutableStateOf(false) }
+                        var editingKey by remember { mutableStateOf<String?>(null) }
+
+                        Button(onClick = { showCreate = true }) {
+                            Text("Add invariant")
+                        }
+
+                        InvariantPresetChips(
+                            onAdd = { key, value ->
+                                controller.upsertInvariant(
+                                    oldKey = null,
+                                    newKey = key,
+                                    value = value
+                                )
+                            }
+                        )
+
+                        if (controller.invariants.isEmpty()) {
+                            Text(
+                                text = "Инварианты пока не заданы.",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                controller.invariants.entries.sortedBy { it.key }.forEach { (key, value) ->
+                                    ElevatedCard(shape = RoundedCornerShape(12.dp)) {
+                                        Column(
+                                            modifier = Modifier.padding(12.dp),
+                                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            Text(
+                                                text = key,
+                                                style = MaterialTheme.typography.labelLarge
+                                            )
+                                            Text(
+                                                text = value,
+                                                style = MaterialTheme.typography.bodyMedium
+                                            )
+                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                OutlinedButton(
+                                                    onClick = { editingKey = key }
+                                                ) { Text("Edit") }
+
+                                                OutlinedButton(
+                                                    onClick = { controller.removeInvariant(key) }
+                                                ) { Text("Delete") }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Text(
+                            text = "Примеры: architecture, technical_decisions, stack_constraints, business_rules.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        if (showCreate) {
+                            InvariantEditorDialog(
+                                title = "Create invariant",
+                                initialKey = "",
+                                initialValue = "",
+                                confirmText = "Create",
+                                onDismiss = { showCreate = false },
+                                onConfirm = { key, value ->
+                                    controller.upsertInvariant(
+                                        oldKey = null,
+                                        newKey = key,
+                                        value = value
+                                    )
+                                    showCreate = false
+                                }
+                            )
+                        }
+
+                        if (editingKey != null) {
+                            val currentKey = editingKey.orEmpty()
+                            val currentValue = controller.invariants[currentKey].orEmpty()
+
+                            InvariantEditorDialog(
+                                title = "Edit invariant",
+                                initialKey = currentKey,
+                                initialValue = currentValue,
+                                confirmText = "Save",
+                                onDismiss = { editingKey = null },
+                                onConfirm = { newKey, newValue ->
+                                    controller.upsertInvariant(
+                                        oldKey = currentKey,
+                                        newKey = newKey,
+                                        value = newValue
+                                    )
+                                    editingKey = null
                                 }
                             )
                         }
@@ -185,7 +298,9 @@ fun SettingsScreen(
                             onExpandedChange = { modelMenuExpanded = !modelMenuExpanded }
                         ) {
                             OutlinedTextField(
-                                modifier = Modifier.menuAnchor().fillMaxWidth(),
+                                modifier = Modifier
+                                    .menuAnchor()
+                                    .fillMaxWidth(),
                                 value = controller.selectedModel.title,
                                 onValueChange = {},
                                 readOnly = true,
@@ -242,7 +357,9 @@ fun SettingsScreen(
 
                                 ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = !expanded }) {
                                     OutlinedTextField(
-                                        modifier = Modifier.menuAnchor().weight(1f),
+                                        modifier = Modifier
+                                            .menuAnchor()
+                                            .weight(1f),
                                         value = controller.currentBranchId,
                                         onValueChange = {},
                                         readOnly = true,
@@ -301,6 +418,52 @@ private fun StrategySelector(
                 selected = value == t,
                 onClick = { onChange(t) },
                 label = { Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun InvariantPresetChips(
+    onAdd: (String, String) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = "Quick presets",
+            style = MaterialTheme.typography.labelMedium
+        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = false,
+                onClick = {
+                    onAdd("architecture", "Использовать только MVVM + Clean Architecture.")
+                },
+                label = { Text("Architecture") }
+            )
+            FilterChip(
+                selected = false,
+                onClick = {
+                    onAdd("technical_decisions", "Использовать coroutines + Flow. Избегать legacy callback API там, где есть suspend/Flow.")
+                },
+                label = { Text("Tech") }
+            )
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = false,
+                onClick = {
+                    onAdd("stack_constraints", "Kotlin, Jetpack Compose, Ktor. Не предлагать Retrofit, XML и RxJava.")
+                },
+                label = { Text("Stack") }
+            )
+            FilterChip(
+                selected = false,
+                onClick = {
+                    onAdd("business_rules", "Нельзя предлагать решения, нарушающие бизнес-правила или обязательные продуктовые ограничения.")
+                },
+                label = { Text("Business") }
             )
         }
     }
@@ -374,6 +537,54 @@ private fun ProfileEditorDialog(
                         )
                     )
                 }
+            ) { Text(confirmText) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
+@Composable
+private fun InvariantEditorDialog(
+    title: String,
+    initialKey: String,
+    initialValue: String,
+    confirmText: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String, String) -> Unit
+) {
+    var key by remember { mutableStateOf(initialKey) }
+    var value by remember { mutableStateOf(initialValue) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = key,
+                    onValueChange = { key = it },
+                    label = { Text("Key") },
+                    placeholder = { Text("architecture") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = { value = it },
+                    label = { Text("Value") },
+                    placeholder = { Text("Использовать только MVVM + Clean Architecture.") },
+                    minLines = 3,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = key.isNotBlank() && value.isNotBlank(),
+                onClick = { onConfirm(key.trim(), value.trim()) }
             ) { Text(confirmText) }
         },
         dismissButton = {
