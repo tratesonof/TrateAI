@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import com.example.trateai.openai.mcp.WeatherMcpClient
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -23,11 +24,16 @@ private const val HISTORY_WINDOW_MESSAGES = 6
 fun rememberChatController(): ChatController {
     val scope = rememberCoroutineScope()
 
+    val httpClient = remember { platformHttpClient() }
+    val weatherClient = remember { WeatherMcpClient() }
+    
     val client = remember {
         OpenAiClient(
             apiKeyProvider = { openAiApiKey() },
-            httpClient = platformHttpClient()
-        )
+            httpClient = httpClient
+        ).also {
+            it.setWeatherClient(weatherClient)
+        }
     }
     val store = remember { ChatStateStore() }
     val loaded = remember { store.load() }
@@ -346,11 +352,36 @@ class ChatController(
                 )
 
                 if (upd != null) {
+                    // Применяем FSM и жёстко ограничиваем переходы
                     val next = applyTaskUpdate(before, upd, userText)
+
                     if (next != before) {
                         taskFsm = next
                         persistAll()
                         println("TASK_FSM updated phase=${next.phase} paused=${next.isPaused}")
+
+                        // Если модель пыталась перепрыгнуть фазу
+                        val proposedPhase = parseTaskPhase(upd.phase)
+                        if (proposedPhase != null && proposedPhase != next.phase) {
+                            val correctionPrompt = """
+Фаза задачи сейчас: ${next.phase.name.lowercase()}.
+Ты не можешь завершить задачу.
+Продолжи работу в текущей фазе и предложи следующий шаг.
+Отвечай как ассистент, без упоминания фаз.
+""".trimIndent()
+
+                            val fixed = client.chat(
+                                messages = listOf(
+                                    ChatMessage("system", correctionPrompt),
+                                    ChatMessage("assistant", upd.expectedAction ?: "")
+                                ),
+                                model = "gpt-5-mini",
+                                temperature = null,
+                            )
+
+                            // Записываем исправленный текст в UI
+                            messagesUi += "assistant" to fixed.text
+                        }
                     }
                 }
 
@@ -362,7 +393,12 @@ class ChatController(
         }
     }
 
-    private fun applyTaskUpdate(current: TaskFsmState, upd: TaskStateUpdate, userText: String): TaskFsmState {
+    private fun applyTaskUpdate(
+        current: TaskFsmState,
+        upd: TaskStateUpdate,
+        userText: String
+    ): TaskFsmState {
+
         val resume = detectPauseResume(userText) == false
         val pause = detectPauseResume(userText) == true
 
@@ -376,26 +412,47 @@ class ChatController(
         if (isPaused && !resume) {
             return current.copy(
                 isPaused = true,
-                expectedAction = upd.expectedAction?.trim().orEmpty().ifBlank { current.expectedAction }
+                expectedAction = upd.expectedAction?.trim().orEmpty()
+                    .ifBlank { current.expectedAction }
             )
         }
 
-        val phase = parseTaskPhase(upd.phase) ?: current.phase
+        val proposedPhase = parseTaskPhase(upd.phase) ?: current.phase
+        val validatedPhase = enforceTaskTransition(current.phase, proposedPhase)
+
         val step = upd.currentStep?.trim().orEmpty().ifBlank { current.currentStep }
         val exp = upd.expectedAction?.trim().orEmpty().ifBlank { current.expectedAction }
 
+        val finalPhase = if (validatedPhase != proposedPhase) current.phase else validatedPhase
+
+        println("FSM: current=${current.phase} proposed=$proposedPhase validated=$finalPhase paused=$isPaused")
+
         return current.copy(
-            phase = phase,
+            phase = finalPhase,
             currentStep = step,
             expectedAction = exp,
             isPaused = isPaused
         )
     }
 
+    private fun enforceTaskTransition(
+        current: TaskPhase,
+        proposed: TaskPhase
+    ): TaskPhase {
+        val allowed = when (current) {
+            TaskPhase.PLANNING -> setOf(TaskPhase.PLANNING, TaskPhase.EXECUTION)
+            TaskPhase.EXECUTION -> setOf(TaskPhase.EXECUTION, TaskPhase.VALIDATION)
+            TaskPhase.VALIDATION -> setOf(TaskPhase.VALIDATION, TaskPhase.EXECUTION, TaskPhase.DONE)
+            TaskPhase.DONE -> setOf(TaskPhase.DONE)
+        }
+        return if (proposed in allowed) proposed else current
+    }
+
     private fun detectPauseResume(text: String): Boolean? {
         val t = text.trim().lowercase()
         val pause = listOf("pause", "пауза", "стоп", "останови", "заморозь")
-        val resume = listOf("resume", "continue", "продолжай", "продолжить", "поехали", "давай дальше")
+        val resume =
+            listOf("resume", "continue", "продолжай", "продолжить", "поехали", "давай дальше")
         return when {
             pause.any { t == it || t.startsWith("$it ") } -> true
             resume.any { t == it || t.startsWith("$it ") } -> false
@@ -503,9 +560,11 @@ class ChatController(
             append("- Ключи: snake_case, короткие. Значения: 1-2 предложения.\n\n")
 
             append("Текущие working facts:\n")
-            append(workingFacts.entries.sortedBy { it.key }.joinToString("\n") { "${it.key}: ${it.value}" }.ifBlank { "(empty)" })
+            append(workingFacts.entries.sortedBy { it.key }
+                .joinToString("\n") { "${it.key}: ${it.value}" }.ifBlank { "(empty)" })
             append("\n\nТекущий long-term профиль:\n")
-            append(longTermProfile.entries.sortedBy { it.key }.joinToString("\n") { "${it.key}: ${it.value}" }.ifBlank { "(empty)" })
+            append(longTermProfile.entries.sortedBy { it.key }
+                .joinToString("\n") { "${it.key}: ${it.value}" }.ifBlank { "(empty)" })
             append("\n\nLong-term notes:\n")
             append(longTermNotes.joinToString("\n").ifBlank { "(empty)" })
 
@@ -533,7 +592,12 @@ class ChatController(
         val end = t.lastIndexOf('}')
         if (start < 0 || end <= start) return null
         val candidate = t.substring(start, end + 1)
-        return runCatching { routerJson.decodeFromString(MemoryRouterResult.serializer(), candidate) }.getOrNull()
+        return runCatching {
+            routerJson.decodeFromString(
+                MemoryRouterResult.serializer(),
+                candidate
+            )
+        }.getOrNull()
     }
 
     private suspend fun sendLegacy(userText: String) {
@@ -577,9 +641,34 @@ class ChatController(
         val profile = selectedProfile()
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
+        
+        val userTextLower = userText.lowercase()
+        val isWeatherQuery = userTextLower.contains("погод") || 
+                            userTextLower.contains("weather") ||
+                            userTextLower.contains("температур") ||
+                            userTextLower.contains("дождь") ||
+                            userTextLower.contains("снег") ||
+                            userTextLower.contains("ветер")
+        
+        // Если спрашивают про погоду - получим данные и добавим в контекст
+        var weatherContext = ""
+        if (isWeatherQuery) {
+            val city = extractCityFromQuery(userText)
+            if (city != null) {
+                val weatherResult = client.getWeatherByCity(city)
+                weatherResult.onSuccess { weather ->
+                    weatherContext = "\n\nТекущие данные о погоде:\n$weather\n"
+                }.onFailure { e ->
+                    println("Weather error: ${e.message}")
+                }
+            }
+        }
+        
+        val tools = if (isWeatherQuery && weatherContext.isEmpty()) McpTools.getTools() else null
+        
         try {
-            val result = client.chat(
-                messages = buildLegacyRequestMessages(
+            val messagesWithWeather = if (weatherContext.isNotEmpty()) {
+                val baseMessages = buildLegacyRequestMessages(
                     profile = profile,
                     taskFsm = taskFsm,
                     invariants = invariants,
@@ -589,10 +678,38 @@ class ChatController(
                     longTermProfile = longTermProfile,
                     longTermNotes = longTermNotes,
                     historyWindow = legacyWindow
-                ),
-                temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
-                model = selectedModel.id
-            )
+                )
+                baseMessages.map { msg ->
+                    if (msg.role == "user") {
+                        ChatMessage(msg.role, msg.content + weatherContext)
+                    } else msg
+                }
+            } else null
+            
+            val result = if (messagesWithWeather != null) {
+                client.chatWithTools(
+                    messages = messagesWithWeather,
+                    temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
+                    model = selectedModel.id,
+                    tools = tools
+                )
+            } else {
+                client.chat(
+                    messages = buildLegacyRequestMessages(
+                        profile = profile,
+                        taskFsm = taskFsm,
+                        invariants = invariants,
+                        legacySummary = legacySummary,
+                        workingFacts = workingFacts,
+                        workingSummary = workingSummary,
+                        longTermProfile = longTermProfile,
+                        longTermNotes = longTermNotes,
+                        historyWindow = legacyWindow
+                    ),
+                    temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
+                    model = selectedModel.id
+                )
+            }
 
             val guarded = applyInvariantGuard(result.text)
 
@@ -617,7 +734,8 @@ class ChatController(
     }
 
     private suspend fun sendSliding(userText: String) {
-        slidingHistory = (slidingHistory + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
+        slidingHistory =
+            (slidingHistory + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
         persistAll()
 
         logRequestSnapshot("SLIDING", shortTermCount = slidingHistory.size)
@@ -625,8 +743,16 @@ class ChatController(
         val profile = selectedProfile()
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
+        
+        val userTextLower = userText.lowercase()
+        val shouldUseTools = userTextLower.contains("погод") || 
+                            userTextLower.contains("weather") ||
+                            userTextLower.contains("температур")
+        
+        val tools = if (shouldUseTools) McpTools.getTools() else null
+        
         try {
-            val result = client.chat(
+            val result = client.chatWithTools(
                 messages = buildSlidingRequestMessages(
                     profile = profile,
                     taskFsm = taskFsm,
@@ -638,7 +764,8 @@ class ChatController(
                     historyWindow = slidingHistory
                 ),
                 temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
-                model = selectedModel.id
+                model = selectedModel.id,
+                tools = tools
             )
 
             val guarded = applyInvariantGuard(result.text)
@@ -651,7 +778,9 @@ class ChatController(
 
             messagesUi += "assistant" to guarded.text
 
-            slidingHistory = (slidingHistory + ChatMessage("assistant", guarded.text)).takeLast(HISTORY_WINDOW_MESSAGES)
+            slidingHistory = (slidingHistory + ChatMessage("assistant", guarded.text)).takeLast(
+                HISTORY_WINDOW_MESSAGES
+            )
             persistAll()
         } catch (t: Throwable) {
             error = t.message ?: t.toString()
@@ -661,7 +790,8 @@ class ChatController(
     }
 
     private suspend fun sendStickyFacts(userText: String) {
-        factsHistory = (factsHistory + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
+        factsHistory =
+            (factsHistory + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
         persistAll()
 
         logRequestSnapshot("FACTS", shortTermCount = factsHistory.size)
@@ -695,7 +825,9 @@ class ChatController(
 
             messagesUi += "assistant" to guarded.text
 
-            factsHistory = (factsHistory + ChatMessage("assistant", guarded.text)).takeLast(HISTORY_WINDOW_MESSAGES)
+            factsHistory = (factsHistory + ChatMessage("assistant", guarded.text)).takeLast(
+                HISTORY_WINDOW_MESSAGES
+            )
             persistAll()
         } catch (t: Throwable) {
             error = t.message ?: t.toString()
@@ -706,7 +838,8 @@ class ChatController(
 
     private suspend fun sendBranching(userText: String) {
         val branch = getCurrentBranch()
-        val newHist = (branch.history + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
+        val newHist =
+            (branch.history + ChatMessage("user", userText)).takeLast(HISTORY_WINDOW_MESSAGES)
         setCurrentBranchState(branch.copy(history = newHist))
         persistAll()
 
@@ -742,7 +875,8 @@ class ChatController(
 
             messagesUi += "assistant" to guarded.text
 
-            val after = (newHist + ChatMessage("assistant", guarded.text)).takeLast(HISTORY_WINDOW_MESSAGES)
+            val after =
+                (newHist + ChatMessage("assistant", guarded.text)).takeLast(HISTORY_WINDOW_MESSAGES)
             setCurrentBranchState(getCurrentBranch().copy(history = after))
             persistAll()
         } catch (t: Throwable) {
@@ -830,7 +964,12 @@ class ChatController(
         val end = t.lastIndexOf('}')
         if (start < 0 || end <= start) return null
         val candidate = t.substring(start, end + 1)
-        return runCatching { routerJson.decodeFromString(InvariantGuardDecision.serializer(), candidate) }.getOrNull()
+        return runCatching {
+            routerJson.decodeFromString(
+                InvariantGuardDecision.serializer(),
+                candidate
+            )
+        }.getOrNull()
     }
 
     private fun applyUsageAndLog(
@@ -933,9 +1072,12 @@ private fun buildMemorySystemBlock(
     if (profile != null) {
         append("\nПрофиль пользователя:\n")
         append("- title: ").append(profile.title).append("\n")
-        if (profile.style.isNotBlank()) append("- style: ").append(profile.style.trim()).append("\n")
-        if (profile.format.isNotBlank()) append("- format: ").append(profile.format.trim()).append("\n")
-        if (profile.constraints.isNotBlank()) append("- constraints: ").append(profile.constraints.trim()).append("\n")
+        if (profile.style.isNotBlank()) append("- style: ").append(profile.style.trim())
+            .append("\n")
+        if (profile.format.isNotBlank()) append("- format: ").append(profile.format.trim())
+            .append("\n")
+        if (profile.constraints.isNotBlank()) append("- constraints: ").append(profile.constraints.trim())
+            .append("\n")
         if (profile.systemPrompt.isNotBlank()) {
             append("\nСистемные инструкции профиля:\n")
             append(profile.systemPrompt.trim()).append("\n")
@@ -997,7 +1139,17 @@ private fun buildLegacyRequestMessages(
         ChatMessage(
             role = "system",
             content = buildString {
-                append(buildMemorySystemBlock(profile, taskFsm, invariants, workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append(
+                    buildMemorySystemBlock(
+                        profile,
+                        taskFsm,
+                        invariants,
+                        workingFacts,
+                        workingSummary,
+                        longTermProfile,
+                        longTermNotes
+                    )
+                )
                 if (legacySummary.isNotBlank()) {
                     append("\n\nКонтекст (legacy summary):\n")
                     append(legacySummary)
@@ -1018,7 +1170,20 @@ private fun buildSlidingRequestMessages(
     longTermNotes: List<String>,
     historyWindow: List<ChatMessage>
 ): List<ChatMessage> = buildList {
-    add(ChatMessage("system", buildMemorySystemBlock(profile, taskFsm, invariants, workingFacts, workingSummary, longTermProfile, longTermNotes)))
+    add(
+        ChatMessage(
+            "system",
+            buildMemorySystemBlock(
+                profile,
+                taskFsm,
+                invariants,
+                workingFacts,
+                workingSummary,
+                longTermProfile,
+                longTermNotes
+            )
+        )
+    )
     addAll(historyWindow)
 }
 
@@ -1036,7 +1201,17 @@ private fun buildStickyFactsRequestMessages(
         ChatMessage(
             "system",
             buildString {
-                append(buildMemorySystemBlock(profile, taskFsm, invariants, workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append(
+                    buildMemorySystemBlock(
+                        profile,
+                        taskFsm,
+                        invariants,
+                        workingFacts,
+                        workingSummary,
+                        longTermProfile,
+                        longTermNotes
+                    )
+                )
                 append("\n\nПравило: используй рабочие facts/память как источник истины; история — только для локального контекста.\n")
             }.trim()
         )
@@ -1059,7 +1234,17 @@ private fun buildBranchingRequestMessages(
         ChatMessage(
             "system",
             buildString {
-                append(buildMemorySystemBlock(profile, taskFsm, invariants, workingFacts, workingSummary, longTermProfile, longTermNotes))
+                append(
+                    buildMemorySystemBlock(
+                        profile,
+                        taskFsm,
+                        invariants,
+                        workingFacts,
+                        workingSummary,
+                        longTermProfile,
+                        longTermNotes
+                    )
+                )
                 append("\n\nВетка диалога: ").append(branchId).append("\n")
             }.trim()
         )
@@ -1120,8 +1305,72 @@ private fun uniqueBranchId(branches: Map<String, BranchState>, suffix: String): 
     }
 }
 
+private fun extractCityFromQuery(query: String): String? {
+    val lower = query.lowercase()
+    
+    // Русские паттерны
+    val ruPatterns = listOf(
+        "погода в ", "погода в городе ", "погода на ", "в ", "в городе "
+    )
+    for (pattern in ruPatterns) {
+        val idx = lower.indexOf(pattern)
+        if (idx >= 0) {
+            val after = query.substring(idx + pattern.length).trim()
+            val endIdx = after.indexOfAny(charArrayOf('?', '!', '.', ','))
+            val city = if (endIdx > 0) after.substring(0, endIdx) else after
+            if (city.isNotBlank() && city.length > 1) {
+                return city.replaceFirstChar { it.uppercase() }
+            }
+        }
+    }
+    
+    // Английские паттерны
+    val enPatterns = listOf(
+        "weather in ", "weather at ", "weather for "
+    )
+    for (pattern in enPatterns) {
+        val idx = lower.indexOf(pattern)
+        if (idx >= 0) {
+            val after = query.substring(idx + pattern.length).trim()
+            val endIdx = after.indexOfAny(charArrayOf('?', '!', '.', ','))
+            val city = if (endIdx > 0) after.substring(0, endIdx) else after
+            if (city.isNotBlank() && city.length > 1) {
+                return city.replaceFirstChar { it.uppercase() }
+            }
+        }
+    }
+    
+    return null
+}
+
 private fun String.shrinkForLog(max: Int): String {
     val s = trim()
     if (s.length <= max) return s
     return s.take(max) + "…(truncated ${s.length - max})"
+}
+
+object McpTools {
+    val weatherTool = ToolDefinition(
+        name = "getweatherdata",
+        description = "Get current weather data for a location. Use this when user asks about weather. Input requires latitude, longitude, and OpenWeatherMap API key.",
+        parameters = ToolParameters(
+            properties = mapOf(
+                "lat" to ToolProperty(
+                    type = "number",
+                    description = "Latitude of the location"
+                ),
+                "lon" to ToolProperty(
+                    type = "number",
+                    description = "Longitude of the location"
+                ),
+                "appid" to ToolProperty(
+                    type = "string",
+                    description = "OpenWeatherMap API key (optional, uses free tier)"
+                )
+            ),
+            required = listOf("lat", "lon")
+        )
+    )
+
+    fun getTools(): List<ToolDefinition> = listOf(weatherTool)
 }

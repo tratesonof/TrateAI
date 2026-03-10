@@ -26,26 +26,28 @@ internal object TaskStateRouter {
         current: TaskFsmState,
         workingSummary: String
     ): Pair<TaskStateUpdate?, ResponseUsage?> {
+
         val model = "gpt-5-mini"
 
         val prompt = buildString {
-            append("Ты обновляешь состояние задачи как конечный автомат.\n")
-            append("Состояние: phase(planning|execution|validation|done), current_step, expected_action, is_paused.\n")
-            append("Верни СТРОГО JSON без текста вокруг.\n\n")
+            append("Ты обновляешь состояние задачи как конечный автомат (FSM).\n")
+            append("Фазы задачи: planning → execution → validation → done\n")
+            append("FSM строго запрещает перепрыгивание этапов\n")
+            append("Текущая фаза — источник истины\n\n")
 
-            append("Формат:\n")
+            append("Правила:\n")
+            append("1. Если FSM говорит, что переход запрещён, не меняй фазу.\n")
+            append("2. Никогда не говори, что задача завершена, если текущая фаза не DONE.\n")
+            append("3. Продолжай работу в текущей фазе, задавай следующий шаг.\n")
+            append("4. current_step и expected_action — коротко, 1 строка.\n")
+            append("5. Если задача на паузе, не продвигай фазу.\n")
+            append("6. Верни строго JSON без текста:\n")
             append("{\n")
             append("  \"phase\": \"planning|execution|validation|done\",\n")
             append("  \"current_step\": \"...\",\n")
             append("  \"expected_action\": \"...\",\n")
             append("  \"is_paused\": true|false\n")
             append("}\n\n")
-
-            append("Правила:\n")
-            append("- Не выдумывай детали. Если нет изменений — верни текущие значения.\n")
-            append("- current_step/expected_action: коротко, 1 строка.\n")
-            append("- Если is_paused=true, НЕ продвигай phase/step без явного resume.\n")
-            append("- Признак resume: пользователь явно просит продолжить (resume/продолжай/continue).\n\n")
 
             append("Текущее состояние:\n")
             append("phase=").append(current.phase.name.lowercase()).append("\n")
@@ -62,7 +64,7 @@ internal object TaskStateRouter {
             append(userMessage).append("\n")
 
             if (!assistantMessage.isNullOrBlank()) {
-                append("\nПоследний ответ ассистента (контекст):\n")
+                append("\nПоследний ответ ассистента:\n")
                 append(assistantMessage)
             }
         }

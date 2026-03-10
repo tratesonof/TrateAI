@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -45,7 +46,8 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun ChatScreen(
     controller: ChatController,
-    onOpenSettings: () -> Unit
+    onOpenSettings: () -> Unit,
+    onOpenWeather: () -> Unit
 ) {
     var input by remember { mutableStateOf("") }
 
@@ -57,6 +59,9 @@ fun ChatScreen(
         TopAppBar(
             title = { Text("TrateAI Chat") },
             actions = {
+                IconButton(onClick = onOpenWeather) {
+                    Icon(Icons.Filled.Cloud, contentDescription = "Weather")
+                }
                 IconButton(onClick = onOpenSettings) {
                     Icon(Icons.Filled.Settings, contentDescription = "Settings")
                 }

@@ -11,14 +11,19 @@ fun AppRoot() {
     when (screen) {
         AppScreen.Chat -> ChatScreen(
             controller = controller,
-            onOpenSettings = { screen = AppScreen.Settings }
+            onOpenSettings = { screen = AppScreen.Settings },
+            onOpenWeather = { screen = AppScreen.Weather }
         )
 
         AppScreen.Settings -> SettingsScreen(
             controller = controller,
             onBack = { screen = AppScreen.Chat }
         )
+
+        AppScreen.Weather -> WeatherScreen(
+            onBack = { screen = AppScreen.Chat }
+        )
     }
 }
 
-private enum class AppScreen { Chat, Settings }
+private enum class AppScreen { Chat, Settings, Weather }
