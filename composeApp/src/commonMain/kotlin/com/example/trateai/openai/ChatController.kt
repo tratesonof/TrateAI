@@ -7,7 +7,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import com.example.trateai.openai.mcp.WeatherMcpClient
+import com.example.trateai.openai.mcp.JsonPlaceholderTodoTool
+import com.example.trateai.openai.mcp.McpToolRegistry
+import com.example.trateai.openai.mcp.McpTools
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -25,14 +27,21 @@ fun rememberChatController(): ChatController {
     val scope = rememberCoroutineScope()
 
     val httpClient = remember { platformHttpClient() }
-    val weatherClient = remember { WeatherMcpClient() }
-    
+
+    val toolRegistry = remember {
+        McpToolRegistry(
+            handlers = listOf(
+                JsonPlaceholderTodoTool(httpClient)
+            )
+        )
+    }
+
     val client = remember {
         OpenAiClient(
             apiKeyProvider = { openAiApiKey() },
             httpClient = httpClient
         ).also {
-            it.setWeatherClient(weatherClient)
+            it.setToolRegistry(toolRegistry)
         }
     }
     val store = remember { ChatStateStore() }
@@ -54,15 +63,12 @@ class ChatController(
     private val store: ChatStateStore,
     initial: ChatState
 ) {
-    // runtime transcript
     val messagesUi = mutableStateListOf<Pair<String, String>>()
 
-    // settings
     var temperature by mutableStateOf(0.7f)
     var selectedModel: ModelSpec by mutableStateOf(MODELS[1])
     var strategy by mutableStateOf(initial.strategy)
 
-    // ===== Profiles =====
     var userProfiles by mutableStateOf(ensureProfiles(initial.userProfiles))
     var selectedProfileId by mutableStateOf(
         initial.selectedProfileId.takeIf { id -> userProfiles.any { it.id == id } }
@@ -124,7 +130,6 @@ class ChatController(
         return map.values.sortedWith(compareBy<UserProfile> { !it.isBuiltIn }.thenBy { it.title })
     }
 
-    // ===== Invariants =====
     var invariants by mutableStateOf(initial.invariants)
 
     fun upsertInvariant(oldKey: String? = null, newKey: String, value: String) {
@@ -137,7 +142,7 @@ class ChatController(
                 remove(oldKey)
             }
             put(normalizedKey, normalizedValue)
-        }.toSortedMap()
+        }.toList().sortedBy { it.first }.toMap()
 
         persistAll()
         println("INVARIANT_UI upsert key=$normalizedKey")
@@ -145,16 +150,14 @@ class ChatController(
 
     fun removeInvariant(key: String) {
         if (!invariants.containsKey(key)) return
-        invariants = invariants.toMutableMap().apply { remove(key) }.toSortedMap()
+        invariants = invariants.toMutableMap().apply { remove(key) }.toList().sortedBy { it.first }.toMap()
         persistAll()
         println("INVARIANT_UI remove key=$key")
     }
 
-    // ===== Task FSM =====
     var taskFsm by mutableStateOf(initial.taskFsm)
     private var taskStateJob: Job? by mutableStateOf(null)
 
-    // short-term (strategy-specific)
     var legacySummary by mutableStateOf(initial.summary)
     val legacyWindow = mutableStateListOf<ChatMessage>().apply { addAll(initial.lastMessages) }
 
@@ -165,26 +168,21 @@ class ChatController(
     var branches by mutableStateOf(initial.branching.branches)
     var checkpoint by mutableStateOf<BranchCheckpoint?>(initial.branching.checkpoint)
 
-    // working memory
     var workingFacts by mutableStateOf(initial.workingFacts)
     var workingSummary by mutableStateOf(initial.workingSummary)
 
-    // long-term memory
     var longTermProfile by mutableStateOf(initial.longTermProfile)
     var longTermNotes by mutableStateOf(initial.longTermNotes)
 
-    // flags
     var isWaitingResponse by mutableStateOf(false)
     var isSummarizing by mutableStateOf(false)
     var isUpdatingFacts by mutableStateOf(false)
     var error by mutableStateOf<String?>(null)
 
-    // tokens (persisted)
     var lastRequestInputTokens by mutableStateOf(initial.totalInputTokens)
     var lastResponseOutputTokens by mutableStateOf(initial.totalOutputTokens)
     var sessionDialogueTokensTotal by mutableStateOf(initial.totalTokens)
 
-    // audit
     var lastMemoryRouterRaw by mutableStateOf<String?>(null)
     var lastMemoryRouterApplied by mutableStateOf<MemoryRouterResult?>(null)
 
@@ -352,7 +350,6 @@ class ChatController(
                 )
 
                 if (upd != null) {
-                    // Применяем FSM и жёстко ограничиваем переходы
                     val next = applyTaskUpdate(before, upd, userText)
 
                     if (next != before) {
@@ -360,7 +357,6 @@ class ChatController(
                         persistAll()
                         println("TASK_FSM updated phase=${next.phase} paused=${next.isPaused}")
 
-                        // Если модель пыталась перепрыгнуть фазу
                         val proposedPhase = parseTaskPhase(upd.phase)
                         if (proposedPhase != null && proposedPhase != next.phase) {
                             val correctionPrompt = """
@@ -379,7 +375,6 @@ class ChatController(
                                 temperature = null,
                             )
 
-                            // Записываем исправленный текст в UI
                             messagesUi += "assistant" to fixed.text
                         }
                     }
@@ -398,7 +393,6 @@ class ChatController(
         upd: TaskStateUpdate,
         userText: String
     ): TaskFsmState {
-
         val resume = detectPauseResume(userText) == false
         val pause = detectPauseResume(userText) == true
 
@@ -641,34 +635,11 @@ class ChatController(
         val profile = selectedProfile()
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
-        
-        val userTextLower = userText.lowercase()
-        val isWeatherQuery = userTextLower.contains("погод") || 
-                            userTextLower.contains("weather") ||
-                            userTextLower.contains("температур") ||
-                            userTextLower.contains("дождь") ||
-                            userTextLower.contains("снег") ||
-                            userTextLower.contains("ветер")
-        
-        // Если спрашивают про погоду - получим данные и добавим в контекст
-        var weatherContext = ""
-        if (isWeatherQuery) {
-            val city = extractCityFromQuery(userText)
-            if (city != null) {
-                val weatherResult = client.getWeatherByCity(city)
-                weatherResult.onSuccess { weather ->
-                    weatherContext = "\n\nТекущие данные о погоде:\n$weather\n"
-                }.onFailure { e ->
-                    println("Weather error: ${e.message}")
-                }
-            }
-        }
-        
-        val tools = if (isWeatherQuery && weatherContext.isEmpty()) McpTools.getTools() else null
-        
+        val tools = McpTools.todoTools()
+
         try {
-            val messagesWithWeather = if (weatherContext.isNotEmpty()) {
-                val baseMessages = buildLegacyRequestMessages(
+            val result = client.chatWithTools(
+                messages = buildLegacyRequestMessages(
                     profile = profile,
                     taskFsm = taskFsm,
                     invariants = invariants,
@@ -678,38 +649,11 @@ class ChatController(
                     longTermProfile = longTermProfile,
                     longTermNotes = longTermNotes,
                     historyWindow = legacyWindow
-                )
-                baseMessages.map { msg ->
-                    if (msg.role == "user") {
-                        ChatMessage(msg.role, msg.content + weatherContext)
-                    } else msg
-                }
-            } else null
-            
-            val result = if (messagesWithWeather != null) {
-                client.chatWithTools(
-                    messages = messagesWithWeather,
-                    temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
-                    model = selectedModel.id,
-                    tools = tools
-                )
-            } else {
-                client.chat(
-                    messages = buildLegacyRequestMessages(
-                        profile = profile,
-                        taskFsm = taskFsm,
-                        invariants = invariants,
-                        legacySummary = legacySummary,
-                        workingFacts = workingFacts,
-                        workingSummary = workingSummary,
-                        longTermProfile = longTermProfile,
-                        longTermNotes = longTermNotes,
-                        historyWindow = legacyWindow
-                    ),
-                    temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
-                    model = selectedModel.id
-                )
-            }
+                ),
+                temperature = if (selectedModel.supportsTemperature) temperature.toDouble() else null,
+                model = selectedModel.id,
+                tools = tools
+            )
 
             val guarded = applyInvariantGuard(result.text)
 
@@ -743,14 +687,8 @@ class ChatController(
         val profile = selectedProfile()
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
-        
-        val userTextLower = userText.lowercase()
-        val shouldUseTools = userTextLower.contains("погод") || 
-                            userTextLower.contains("weather") ||
-                            userTextLower.contains("температур")
-        
-        val tools = if (shouldUseTools) McpTools.getTools() else null
-        
+        val tools = McpTools.todoTools()
+
         try {
             val result = client.chatWithTools(
                 messages = buildSlidingRequestMessages(
@@ -1072,12 +1010,9 @@ private fun buildMemorySystemBlock(
     if (profile != null) {
         append("\nПрофиль пользователя:\n")
         append("- title: ").append(profile.title).append("\n")
-        if (profile.style.isNotBlank()) append("- style: ").append(profile.style.trim())
-            .append("\n")
-        if (profile.format.isNotBlank()) append("- format: ").append(profile.format.trim())
-            .append("\n")
-        if (profile.constraints.isNotBlank()) append("- constraints: ").append(profile.constraints.trim())
-            .append("\n")
+        if (profile.style.isNotBlank()) append("- style: ").append(profile.style.trim()).append("\n")
+        if (profile.format.isNotBlank()) append("- format: ").append(profile.format.trim()).append("\n")
+        if (profile.constraints.isNotBlank()) append("- constraints: ").append(profile.constraints.trim()).append("\n")
         if (profile.systemPrompt.isNotBlank()) {
             append("\nСистемные инструкции профиля:\n")
             append(profile.systemPrompt.trim()).append("\n")
@@ -1307,8 +1242,7 @@ private fun uniqueBranchId(branches: Map<String, BranchState>, suffix: String): 
 
 private fun extractCityFromQuery(query: String): String? {
     val lower = query.lowercase()
-    
-    // Русские паттерны
+
     val ruPatterns = listOf(
         "погода в ", "погода в городе ", "погода на ", "в ", "в городе "
     )
@@ -1323,8 +1257,7 @@ private fun extractCityFromQuery(query: String): String? {
             }
         }
     }
-    
-    // Английские паттерны
+
     val enPatterns = listOf(
         "weather in ", "weather at ", "weather for "
     )
@@ -1339,7 +1272,7 @@ private fun extractCityFromQuery(query: String): String? {
             }
         }
     }
-    
+
     return null
 }
 
@@ -1347,30 +1280,4 @@ private fun String.shrinkForLog(max: Int): String {
     val s = trim()
     if (s.length <= max) return s
     return s.take(max) + "…(truncated ${s.length - max})"
-}
-
-object McpTools {
-    val weatherTool = ToolDefinition(
-        name = "getweatherdata",
-        description = "Get current weather data for a location. Use this when user asks about weather. Input requires latitude, longitude, and OpenWeatherMap API key.",
-        parameters = ToolParameters(
-            properties = mapOf(
-                "lat" to ToolProperty(
-                    type = "number",
-                    description = "Latitude of the location"
-                ),
-                "lon" to ToolProperty(
-                    type = "number",
-                    description = "Longitude of the location"
-                ),
-                "appid" to ToolProperty(
-                    type = "string",
-                    description = "OpenWeatherMap API key (optional, uses free tier)"
-                )
-            ),
-            required = listOf("lat", "lon")
-        )
-    )
-
-    fun getTools(): List<ToolDefinition> = listOf(weatherTool)
 }
