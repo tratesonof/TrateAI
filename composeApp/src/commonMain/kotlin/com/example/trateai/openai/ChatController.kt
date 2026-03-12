@@ -10,6 +10,8 @@ import androidx.compose.runtime.setValue
 import com.example.trateai.openai.mcp.JsonPlaceholderTodoTool
 import com.example.trateai.openai.mcp.McpToolRegistry
 import com.example.trateai.openai.mcp.McpTools
+import com.example.trateai.openai.todo.GetTodoMonitorReportTool
+import com.example.trateai.openai.todo.ScheduleTodoMonitorTool
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -31,7 +33,9 @@ fun rememberChatController(): ChatController {
     val toolRegistry = remember {
         McpToolRegistry(
             handlers = listOf(
-                JsonPlaceholderTodoTool(httpClient)
+                JsonPlaceholderTodoTool(httpClient),
+                ScheduleTodoMonitorTool(),
+                GetTodoMonitorReportTool()
             )
         )
     }
@@ -635,7 +639,7 @@ class ChatController(
         val profile = selectedProfile()
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
-        val tools = McpTools.todoTools()
+        val tools = McpTools.todoTools() + McpTools.schedulerTools()
 
         try {
             val result = client.chatWithTools(
@@ -687,7 +691,7 @@ class ChatController(
         val profile = selectedProfile()
         isWaitingResponse = true
         val started = TimeSource.Monotonic.markNow()
-        val tools = McpTools.todoTools()
+        val tools = McpTools.todoTools() + McpTools.schedulerTools()
 
         try {
             val result = client.chatWithTools(

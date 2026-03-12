@@ -20,4 +20,28 @@ object McpTools {
             )
         )
     )
+
+    fun schedulerTools(): List<ToolDefinition> = listOf(
+        ToolDefinition(
+            name = "schedule_todo_monitor",
+            description = "Schedule periodic monitoring of todo items",
+            parameters = ToolParameters(
+                properties = mapOf(
+                    "interval_hours" to ToolProperty(
+                        type = "integer",
+                        description = "How often to run monitoring in hours"
+                    )
+                ),
+                required = listOf("interval_hours")
+            )
+        ),
+        ToolDefinition(
+            name = "get_todo_monitor_report",
+            description = "Get aggregated report for periodic todo monitoring",
+            parameters = ToolParameters(
+                properties = emptyMap(),
+                required = emptyList()
+            )
+        )
+    )
 }
